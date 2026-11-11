@@ -64,7 +64,7 @@ class SessioneEstesa(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
         return try {
             gestore.getCameraExtensionCharacteristics(idCamera)
-                .getAvailableCaptureRequestKeys<Any>(estensione)
+                .getAvailableCaptureRequestKeys(estensione)
                 .any { it.name == chiave.name }
         } catch (_: Throwable) {
             false
