@@ -459,6 +459,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private var cameraDevice: CameraDevice? = null
     private var session: CameraCaptureSession? = null
+    private var chiusuraSessione: CountDownLatch? = null
     private var lenteAttuale: Lente? = null
     private var rawReader: ImageReader? = null
     private var jpegReader: ImageReader? = null
@@ -797,6 +798,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         if (lente == lenteAttuale && session != null && sessionePronta) return
 
         sessionePronta = false
+        val chiusuraPrecedente = chiusuraSessione
         try {
             session?.stopRepeating()
         } catch (_: Throwable) {
@@ -806,6 +808,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         } catch (_: Throwable) {
         }
         session = null
+        // Attende che la fotocamera confermi la chiusura della sessione precedente:
+        // passare subito al nuovo obiettivo senza aspettare può bloccare la fotocamera (timeout).
+        try {
+            chiusuraPrecedente?.await(3, TimeUnit.SECONDS)
+        } catch (_: Throwable) {
+        }
         try {
             rawReader?.close()
         } catch (_: Throwable) {
@@ -852,6 +860,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val surfaces = listOfNotNull(configAnteprima, configRaw, configJpeg)
 
             val latch = CountDownLatch(1)
+            val chiusuraNuova = CountDownLatch(1)
+            chiusuraSessione = chiusuraNuova
             var erroreCreazione = ""
             try {
                 cam.createCaptureSession(
@@ -865,6 +875,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                             override fun onConfigureFailed(s: CameraCaptureSession) {
                                 erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+RAW+JPEG per l'obiettivo $lente"
                                 latch.countDown()
+                            }
+                            override fun onClosed(s: CameraCaptureSession) {
+                                chiusuraNuova.countDown()
                             }
                         }
                     )
