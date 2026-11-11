@@ -102,7 +102,7 @@ class MainActivity : Activity() {
             }
             logView.text = synchronized(report) { report.toString() }
         } else {
-            logView.text = "Premi \"Avvia test fotocamere\". Il test dura circa 1 minuto."
+            logView.text = "VERSIONE 3. Premi \"Avvia test fotocamere\". Il test dura circa 1 minuto."
         }
 
         val scroll = ScrollView(this)
@@ -189,6 +189,7 @@ class MainActivity : Activity() {
 
     private fun runAll() {
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        log("Test VERSIONE 3")
         log("Telefono: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
 
         val ids = manager.cameraIdList
