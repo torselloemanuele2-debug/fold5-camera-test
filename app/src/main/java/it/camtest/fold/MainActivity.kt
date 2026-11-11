@@ -462,9 +462,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var lenteAttuale: Lente? = null
     private var jpegReader: ImageReader? = null
     private var previewSurface: Surface? = null
+    // Thread di lavoro: esegue le sequenze che si bloccano in attesa (apri, configura, scatta).
     private val cameraThread = HandlerThread("fotocamera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
-    private val cameraExecutor = Executor { r -> cameraHandler.post(r) }
+    // Thread dei callback: DEVE essere diverso da quello di lavoro, altrimenti i callback
+    // restano in coda dietro l'attesa (latch.await) e la fotocamera non parte mai.
+    private val callbackThread = HandlerThread("fotocamera-callback").also { it.start() }
+    private val callbackHandler = Handler(callbackThread.looper)
+    private val callbackExecutor = Executor { r -> callbackHandler.post(r) }
 
     private val codaJpeg = LinkedBlockingQueue<Image>(2)
 
@@ -512,6 +517,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         super.onDestroy()
         chiudiTutto()
         cameraThread.quitSafely()
+        callbackThread.quitSafely()
     }
 
     // --------------------------------------------------------
@@ -769,7 +775,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         cameraHandler.post {
             try {
                 val latch = CountDownLatch(1)
-                cameraManager.openCamera(backId, cameraExecutor, object : CameraDevice.StateCallback() {
+                cameraManager.openCamera(backId, callbackExecutor, object : CameraDevice.StateCallback() {
                     override fun onOpened(c: CameraDevice) {
                         cameraDevice = c
                         latch.countDown()
@@ -840,7 +846,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     if (img != null && !codaJpeg.offer(img)) img.close()
                 } catch (_: Throwable) {
                 }
-            }, cameraHandler)
+            }, callbackHandler)
             jpegReader = nuovoJpeg
 
             val fisicoId = fisici[lente]
@@ -862,7 +868,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             try {
                 cam.createCaptureSession(
                     SessionConfiguration(
-                        SessionConfiguration.SESSION_REGULAR, surfaces, cameraExecutor,
+                        SessionConfiguration.SESSION_REGULAR, surfaces, callbackExecutor,
                         object : CameraCaptureSession.StateCallback() {
                             override fun onConfigured(s: CameraCaptureSession) {
                                 session = s
@@ -907,7 +913,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     res.get(CaptureResult.CONTROL_AF_STATE)?.let { ultimoAfState = it }
                     res.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { ultimoFocusDistance = it }
                 }
-            }, cameraHandler)
+            }, callbackHandler)
             sessionePronta = true
         } catch (t: Throwable) {
             logFile.appendText("Errore configuraSessione (lente=$lente): ${describeError(t)}\n")
@@ -993,7 +999,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
                 latch.countDown()
             }
-        }, cameraHandler)
+        }, callbackHandler)
         if (!latch.await(10, TimeUnit.SECONDS) || result == null) {
             uiHandler.post { statoView.text = "Scatto non riuscito, riprova." }
             return
