@@ -11,8 +11,8 @@ android {
         applicationId = "it.camtest.fold"
         minSdk = 29
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
 
     val chiave = rootProject.file("keystore.p12")
@@ -41,4 +41,9 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+}
+
+dependencies {
+    // Riconoscimento della persona per l'effetto ritratto (modello incluso nell'app).
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 }

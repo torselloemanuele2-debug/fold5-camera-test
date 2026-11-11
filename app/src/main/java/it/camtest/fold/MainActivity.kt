@@ -82,6 +82,8 @@ data class Scenario(
     // Se impostato, il tempo di scatto non supera questo valore (limite per foto a mano libera).
     val tempoMassimoManuale: Double? = null,
     val isoMassimo: Int = 1600,
+    // Se vero, dopo lo scatto viene creata anche una versione con lo sfondo sfocato (effetto ritratto).
+    val sfocaSfondo: Boolean = false,
     val consiglio: String,
     val paroleChiave: List<String> = emptyList()
 )
@@ -167,8 +169,8 @@ object Catalogo {
         // --- RITRATTO ---
         Scenario(
             "Ritratto con sfondo sfocato", "Ritratto", Lente.TELE, Fuoco.VICINO,
-            tempoMassimoManuale = 1.0 / 60, isoMassimo = 1600,
-            consiglio = "Metti distanza tra il soggetto e lo sfondo: più distante è lo sfondo, più risulterà sfocato.",
+            tempoMassimoManuale = 1.0 / 60, isoMassimo = 1600, sfocaSfondo = true,
+            consiglio = "Inquadra una persona a mezzo busto. L'app salva la foto normale e una seconda con lo sfondo sfocato (_ritratto). Più lo sfondo è distante, meglio funziona.",
             paroleChiave = listOf("ritratto", "bokeh", "sfocato", "sfondo")
         ),
         Scenario(
@@ -577,6 +579,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         bottoneCopia.setOnClickListener { copiaReport() }
         rigaBottoni.addView(bottoneCopia, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
+        val bottoneDiagnostica = Button(this)
+        bottoneDiagnostica.text = "Diagnostica"
+        bottoneDiagnostica.setOnClickListener { avviaDiagnostica() }
+        rigaBottoni.addView(bottoneDiagnostica, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
         root.addView(rigaBottoni)
 
         setContentView(root)
@@ -681,8 +688,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         try {
             val chars = caratteristiche[Lente.PRINCIPALE] ?: cameraManager.getCameraCharacteristics(backId)
             val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val taglia = mappa?.getOutputSizes(SurfaceTexture::class.java)
-                ?.minByOrNull { kotlin.math.abs(it.width.toLong() * height - it.height.toLong() * width) }
+            // La vista è verticale, il sensore orizzontale: confronto le proporzioni del lato lungo
+            // sul corto e prendo la risoluzione più alta (fino a 1920) con proporzioni compatibili.
+            val proporzione = maxOf(width, height).toDouble() / minOf(width, height).coerceAtLeast(1)
+            val disponibili = mappa?.getOutputSizes(SurfaceTexture::class.java)?.filter { it.width <= 1920 }
+            val taglia = disponibili
+                ?.filter { kotlin.math.abs(it.width.toDouble() / it.height - proporzione) < 0.05 }
+                ?.maxByOrNull { it.width.toLong() * it.height }
+                ?: disponibili?.maxByOrNull { it.width.toLong() * it.height }
             if (taglia != null) {
                 surface.setDefaultBufferSize(taglia.width, taglia.height)
             }
@@ -922,6 +935,113 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     // --------------------------------------------------------
+    // Diagnostica e qualità
+    // --------------------------------------------------------
+
+    private fun avviaDiagnostica() {
+        statoView.text = "Raccolgo le informazioni sulle fotocamere..."
+        cameraHandler.post {
+            val testo = try {
+                diagnostica()
+            } catch (t: Throwable) {
+                "Errore diagnostica: ${describeError(t)}"
+            }
+            uiHandler.post { statoView.text = testo }
+        }
+    }
+
+    private fun elenco(valori: IntArray?): String = valori?.joinToString(",") ?: "-"
+
+    private fun nomeEstensione(e: Int): String = when (e) {
+        0 -> "AUTOMATICO"
+        1 -> "RITOCCO_VOLTO"
+        2 -> "BOKEH"
+        3 -> "HDR"
+        4 -> "NOTTE"
+        else -> "ESTENSIONE_$e"
+    }
+
+    private fun diagnostica(): String = buildString {
+        append("=== DIAGNOSTICA ===\n")
+        append("${Build.MANUFACTURER} ${Build.MODEL}  Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
+        append("Fotocamera posteriore usata dall'app: $backId\n\n")
+        for (id in cameraManager.cameraIdList) {
+            try {
+                val c = cameraManager.getCameraCharacteristics(id)
+                val lato = when (c.get(CameraCharacteristics.LENS_FACING)) {
+                    CameraCharacteristics.LENS_FACING_BACK -> "POST"
+                    CameraCharacteristics.LENS_FACING_FRONT -> "ANT"
+                    else -> "EXT"
+                }
+                val focali = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.joinToString(",") ?: "-"
+                append("Camera $id [$lato] fisiche=${c.physicalCameraIds} focale=${focali}mm eq35=${equivalenteMm(c).roundToInt()}mm\n")
+                append("  rumore=${elenco(c.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES))}")
+                append("  bordi=${elenco(c.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES))}")
+                append("  stabilizzatore=${elenco(c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION))}\n")
+                val mappa = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val jpeg = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
+                append("  JPEG massimo=${jpeg ?: "-"}\n")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val estensioni = try {
+                        cameraManager.getCameraExtensionCharacteristics(id).supportedExtensions
+                            .joinToString(",") { nomeEstensione(it) }
+                            .ifEmpty { "nessuna" }
+                    } catch (t: Throwable) {
+                        "errore ${t.javaClass.simpleName}"
+                    }
+                    append("  estensioni=$estensioni\n")
+                }
+            } catch (t: Throwable) {
+                append("Camera $id: errore ${describeError(t)}\n")
+            }
+        }
+        append("\nObiettivi riconosciuti dall'app:\n")
+        for (l in Lente.values()) {
+            append("  $l -> ${fisici[l]?.let { "fisica $it" } ?: "logica $backId"}\n")
+        }
+    }
+
+    /** Chiede alla fotocamera la lavorazione migliore (rumore, nitidezza, colori), se il telefono la offre. */
+    private fun impostaQualita(b: CaptureRequest.Builder) {
+        val c = try {
+            cameraManager.getCameraCharacteristics(backId)
+        } catch (_: Throwable) {
+            return
+        }
+        fun usa(disponibili: CameraCharacteristics.Key<IntArray>, chiave: CaptureRequest.Key<Int>, voluto: Int) {
+            if (c.get(disponibili)?.contains(voluto) == true) b.set(chiave, voluto)
+        }
+        usa(
+            CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES,
+            CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES,
+            CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.COLOR_CORRECTION_AVAILABLE_ABERRATION_MODES,
+            CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.HOT_PIXEL_AVAILABLE_HOT_PIXEL_MODES,
+            CaptureRequest.HOT_PIXEL_MODE, CaptureRequest.HOT_PIXEL_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.SHADING_AVAILABLE_MODES,
+            CaptureRequest.SHADING_MODE, CaptureRequest.SHADING_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES,
+            CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_HIGH_QUALITY
+        )
+        usa(
+            CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION,
+            CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+        )
+    }
+
+    // --------------------------------------------------------
     // Scatto
     // --------------------------------------------------------
 
@@ -987,7 +1107,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         richiesta.set(CaptureRequest.LENS_FOCUS_DISTANCE, distanzaFuoco)
         richiesta.set(CaptureRequest.CONTROL_AWB_MODE, sc.bilanciamento.modo)
         richiesta.set(CaptureRequest.JPEG_ORIENTATION, orientamentoJpeg(chars))
-        richiesta.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+        richiesta.set(CaptureRequest.JPEG_QUALITY, 98.toByte())
+        impostaQualita(richiesta)
 
         val latch = CountDownLatch(1)
         var result: TotalCaptureResult? = null
@@ -1012,6 +1133,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val base = "${sloggiato}_${System.currentTimeMillis()}"
 
         var nomeFileJpeg = ""
+        var bytesJpeg: ByteArray? = null
         if (jpegR != null) {
             var img: Image? = null
             val fine = System.currentTimeMillis() + 4000
@@ -1020,7 +1142,27 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 if (ts == null || candidato.timestamp == ts) img = candidato else candidato.close()
             }
             if (img != null) {
-                nomeFileJpeg = salvaJpeg(img, "$base.jpg")
+                bytesJpeg = try {
+                    estraiBytes(img)
+                } catch (t: Throwable) {
+                    logFile.appendText("Errore lettura JPEG: ${describeError(t)}\n")
+                    null
+                } finally {
+                    img.close()
+                }
+                if (bytesJpeg != null) nomeFileJpeg = salvaBytes(bytesJpeg, "$base.jpg")
+            }
+        }
+
+        var nomeRitratto = ""
+        var erroreRitratto = ""
+        if (sc.sfocaSfondo && bytesJpeg != null) {
+            uiHandler.post { statoView.text = "Foto scattata. Riconosco la persona e sfoco lo sfondo..." }
+            try {
+                nomeRitratto = salvaBytes(SfocaturaSfondo.applica(bytesJpeg), "${base}_ritratto.jpg")
+            } catch (t: Throwable) {
+                erroreRitratto = t.message ?: t.javaClass.simpleName
+                logFile.appendText("Errore sfocatura sfondo: ${describeError(t)}\n")
             }
         }
 
@@ -1031,6 +1173,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             append("Tempo di scatto: $expoText   ISO: ${risultato.iso}\n\n")
             append("${sc.consiglio}\n\n")
             if (nomeFileJpeg.isNotEmpty()) append("Foto: $nomeFileJpeg\n")
+            if (nomeRitratto.isNotEmpty()) append("Foto con sfondo sfocato: $nomeRitratto\n")
+            if (erroreRitratto.isNotEmpty()) append("Sfondo non sfocato: $erroreRitratto\n")
             append("\nCartella: Pictures/FotoScenari")
         }
         uiHandler.post { statoView.text = testo }
@@ -1049,25 +1193,24 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         return (sensorOrientation - gradi + 360) % 360
     }
 
-    private fun salvaJpeg(img: Image, nome: String): String {
+    private fun estraiBytes(img: Image): ByteArray {
+        val buffer = img.planes[0].buffer
+        val bytes = ByteArray(buffer.remaining())
+        buffer.get(bytes)
+        return bytes
+    }
+
+    private fun salvaBytes(bytes: ByteArray, nome: String): String {
         return try {
-            val buffer = img.planes[0].buffer
-            val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
             val values = ContentValues()
             values.put(MediaStore.Images.Media.DISPLAY_NAME, nome)
             values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
             values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FotoScenari")
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return ""
             contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            img.close()
             nome
         } catch (t: Throwable) {
-            logFile.appendText("Errore salvaJpeg: ${describeError(t)}\n")
-            try {
-                img.close()
-            } catch (_: Throwable) {
-            }
+            logFile.appendText("Errore salvataggio $nome: ${describeError(t)}\n")
             ""
         }
     }
