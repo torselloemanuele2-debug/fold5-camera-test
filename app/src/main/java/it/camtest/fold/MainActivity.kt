@@ -452,6 +452,16 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var listaScenari: LinearLayout
     private lateinit var statoView: TextView
     private lateinit var bottoneScatta: Button
+    private lateinit var mirino: MirinoView
+    private lateinit var etichettaLuce: TextView
+
+    // Correzione dell'esposizione dell'anteprima (e quindi dello scatto, che parte dalla sua misura).
+    private var compIndice = 0
+    private var compPasso = 0f
+    private var compMin = 0
+    private var compMax = 0
+    private var builderAnteprima: CaptureRequest.Builder? = null
+    private var callbackAnteprima: CameraCaptureSession.CaptureCallback? = null
 
     private lateinit var cameraManager: CameraManager
     private var backId: String = "0"
@@ -504,6 +514,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
         costruisciInterfaccia()
         rilevaLenti()
+        aggiornaEtichettaLuce()
 
         val vecchioCrash = try {
             if (logFile.exists()) logFile.readText() else ""
@@ -530,20 +541,52 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
 
-        val larghezzaSchermo = resources.displayMetrics.widthPixels
-        val altezzaPreview = (larghezzaSchermo * 4 / 3)
+        // L'anteprima ha le STESSE proporzioni 3:4 della foto (4:3 in verticale) e non viene mai
+        // stirata: se lo schermo è basso, si riduce tutta insieme (centrata su fondo nero).
+        val metriche = resources.displayMetrics
+        val altezzaMassima = minOf(metriche.widthPixels * 4 / 3, (metriche.heightPixels * 0.55f).toInt())
+        val larghezzaPreview = altezzaMassima * 3 / 4
+        val altezzaPreview = larghezzaPreview * 4 / 3
 
         val contenitorePreview = FrameLayout(this)
+        contenitorePreview.setBackgroundColor(Color.BLACK)
         contenitorePreview.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, altezzaPreview
         )
+        val areaFoto = FrameLayout(this)
         textureView = TextureView(this)
         textureView.surfaceTextureListener = this
-        contenitorePreview.addView(
+        areaFoto.addView(
             textureView,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         )
+        mirino = MirinoView(this)
+        areaFoto.addView(
+            mirino,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        contenitorePreview.addView(
+            areaFoto,
+            FrameLayout.LayoutParams(larghezzaPreview, altezzaPreview, Gravity.CENTER)
+        )
         root.addView(contenitorePreview)
+
+        val rigaLuce = LinearLayout(this)
+        rigaLuce.orientation = LinearLayout.HORIZONTAL
+        rigaLuce.gravity = Gravity.CENTER_VERTICAL
+        val bottoneMeno = Button(this)
+        bottoneMeno.text = "Luce −"
+        bottoneMeno.setOnClickListener { cambiaLuce(-1) }
+        rigaLuce.addView(bottoneMeno, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        etichettaLuce = TextView(this)
+        etichettaLuce.gravity = Gravity.CENTER
+        etichettaLuce.setTypeface(null, Typeface.BOLD)
+        rigaLuce.addView(etichettaLuce, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f))
+        val bottonePiu = Button(this)
+        bottonePiu.text = "Luce +"
+        bottonePiu.setOnClickListener { cambiaLuce(1) }
+        rigaLuce.addView(bottonePiu, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(rigaLuce)
 
         campoRicerca = EditText(this)
         campoRicerca.hint = "Cerca uno scenario (es. notte, ritratto, sport)..."
@@ -753,6 +796,17 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val logicalChars = cameraManager.getCameraCharacteristics(backId)
             val physIds = logicalChars.physicalCameraIds.toList()
 
+            // Correzione esposizione: parto da +0,7 EV, perché l'esposizione "neutra" della fotocamera
+            // tende a dare foto più scure di quelle a cui siamo abituati.
+            val intervalloComp = logicalChars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+            val passoComp = logicalChars.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0f
+            if (intervalloComp != null && passoComp > 0f) {
+                compMin = intervalloComp.lower
+                compMax = intervalloComp.upper
+                compPasso = passoComp
+                compIndice = Math.round(0.7f / passoComp).coerceIn(compMin, compMax)
+            }
+
             if (physIds.size >= 3) {
                 val conFocale = physIds.map { it to equivalenteMm(cameraManager.getCameraCharacteristics(it)) }
                     .sortedBy { it.second }
@@ -854,7 +908,13 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         try {
             val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
             val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val jpegSize = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
+            // Risoluzione più alta con le STESSE proporzioni 4:3 dell'anteprima, così la foto
+            // contiene esattamente ciò che vedi.
+            val tutteJpeg = mappa?.getOutputSizes(ImageFormat.JPEG)
+            val jpegSize = tutteJpeg
+                ?.filter { kotlin.math.abs(it.width.toDouble() / it.height - 4.0 / 3.0) < 0.02 }
+                ?.maxByOrNull { it.width.toLong() * it.height }
+                ?: tutteJpeg?.maxByOrNull { it.width.toLong() * it.height }
 
             val nuovoJpeg = if (jpegSize != null) ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2) else null
             nuovoJpeg?.setOnImageAvailableListener({ r ->
@@ -946,18 +1006,78 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             richiesta.addTarget(anteprima)
             richiesta.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-            sess.setRepeatingRequest(richiesta.build(), object : CameraCaptureSession.CaptureCallback() {
+            if (compPasso > 0f) richiesta.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compIndice)
+            // Con poca luce l'esposizione automatica è limitata a 1/30 s dal frame rate dell'anteprima,
+            // e la misura risulta troppo scura: consento un frame rate più basso (esposizioni più lunghe).
+            val intervalli = try {
+                cameraManager.getCameraCharacteristics(backId).get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            } catch (_: Throwable) {
+                null
+            }
+            val intervallo = intervalli?.filter { it.upper in 24..30 && it.lower >= 10 }?.minByOrNull { it.lower }
+            if (intervallo != null) richiesta.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, intervallo)
+
+            // Misuro luce e fuoco sull'obiettivo fisico che scatta davvero (non su quello principale).
+            val idMisura = if (anteprimaFedele) fisicoId else null
+            val callback = object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
-                    res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { ultimoExpoNs = it }
-                    res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { ultimoIso = it }
+                    val fisico: CaptureResult? = if (idMisura != null) res.physicalCameraResults[idMisura] else null
+                    (fisico?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: res.get(CaptureResult.SENSOR_EXPOSURE_TIME))
+                        ?.let { ultimoExpoNs = it }
+                    (fisico?.get(CaptureResult.SENSOR_SENSITIVITY) ?: res.get(CaptureResult.SENSOR_SENSITIVITY))
+                        ?.let { ultimoIso = it }
                     res.get(CaptureResult.CONTROL_AF_STATE)?.let { ultimoAfState = it }
                     res.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { ultimoFocusDistance = it }
                 }
-            }, callbackHandler)
+            }
+            builderAnteprima = richiesta
+            callbackAnteprima = callback
+            sess.setRepeatingRequest(richiesta.build(), callback, callbackHandler)
             sessionePronta = true
+
+            val mm = equivalenteMm(caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)).roundToInt()
+            val nomeLente = when (lente) {
+                Lente.ULTRA -> "ULTRA-GRANDANGOLO"
+                Lente.PRINCIPALE -> "PRINCIPALE"
+                Lente.TELE -> "TELE"
+            }
+            val avviso = if (fisicoId != null && !anteprimaFedele) "  (anteprima non fedele)" else ""
+            uiHandler.post { mirino.etichetta = "$nomeLente · ${mm} mm · 4:3$avviso" }
         } catch (t: Throwable) {
             logFile.appendText("Errore configuraSessione (lente=$lente): ${describeError(t)}\n")
             uiHandler.post { statoView.text = "Errore nella configurazione della fotocamera (obiettivo: $lente):\n${describeError(t)}" }
+        }
+    }
+
+    // --------------------------------------------------------
+    // Luce (correzione dell'esposizione)
+    // --------------------------------------------------------
+
+    private fun aggiornaEtichettaLuce() {
+        etichettaLuce.text = if (compPasso <= 0f) {
+            "Luce automatica"
+        } else {
+            String.format(Locale.ITALY, "Luce %+.1f EV", compIndice * compPasso)
+        }
+    }
+
+    private fun cambiaLuce(delta: Int) {
+        if (compPasso <= 0f) return
+        compIndice = (compIndice + delta).coerceIn(compMin, compMax)
+        aggiornaEtichettaLuce()
+        cameraHandler.post { aggiornaAnteprima() }
+    }
+
+    /** Rimanda alla fotocamera la richiesta d'anteprima con la luce aggiornata. Thread della fotocamera. */
+    private fun aggiornaAnteprima() {
+        val s = session ?: return
+        val b = builderAnteprima ?: return
+        val cb = callbackAnteprima ?: return
+        try {
+            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, compIndice)
+            s.setRepeatingRequest(b.build(), cb, callbackHandler)
+        } catch (t: Throwable) {
+            logFile.appendText("Errore aggiornamento luce: ${describeError(t)}\n")
         }
     }
 
@@ -1120,6 +1240,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             expoRange?.lower ?: 1_000_000L, expoRange?.upper ?: 2_000_000_000L,
             isoRange?.lower ?: 50, isoRange?.upper ?: 3200
         )
+        val misuraTesto = "luce misurata 1/${(1_000_000_000.0 / maxOf(ultimoExpoNs, 1L)).roundToInt()} s ISO $ultimoIso" +
+            (if (compPasso > 0f) String.format(Locale.ITALY, " (luce %+.1f EV)", compIndice * compPasso) else "")
+        logFile.appendText("Scatto ${sc.nome} [${sc.lente}]: $misuraTesto -> scelto 1/${(1_000_000_000.0 / risultato.tempoNs).roundToInt()} s ISO ${risultato.iso}\n")
 
         uiHandler.post { statoView.text = "Scatto in corso...\nTempo: 1/${(1_000_000_000.0 / risultato.tempoNs).roundToInt()} s   ISO: ${risultato.iso}" }
 
@@ -1197,7 +1320,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val testo = buildString {
             append("Scenario: ${sc.nome}\n")
             append("Obiettivo: ${sc.lente}\n")
-            append("Tempo di scatto: $expoText   ISO: ${risultato.iso}\n\n")
+            append("Tempo di scatto: $expoText   ISO: ${risultato.iso}\n")
+            append("($misuraTesto)\n\n")
             append("${sc.consiglio}\n\n")
             if (nomeFileJpeg.isNotEmpty()) append("Foto: $nomeFileJpeg\n")
             if (nomeRitratto.isNotEmpty()) append("Foto con sfondo sfocato: $nomeRitratto\n")

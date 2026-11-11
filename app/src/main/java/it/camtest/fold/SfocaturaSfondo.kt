@@ -19,53 +19,132 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Ritratto con sfondo sfocato: riconosce la persona (ML Kit), tiene nitido il soggetto
- * e sfoca tutto il resto. Da chiamare SEMPRE fuori dal thread principale.
+ * Ritratto con sfondo sfocato, in quattro passi:
+ *  1. ML Kit riconosce la persona (maschera grossolana);
+ *  2. un filtro guidato dalla foto aggancia il bordo della maschera ai contorni reali;
+ *  3. lo sfondo viene sfocato SENZA far "colare" i colori del soggetto (niente aloni);
+ *  4. il soggetto nitido viene sovrapposto allo sfondo sfocato, sulla foto a piena risoluzione.
+ * Da chiamare SEMPRE fuori dal thread principale.
  */
 object SfocaturaSfondo {
 
     // Oltre questa risoluzione la foto viene ridotta (evita di finire la memoria con i 50 MP).
     private const val PIXEL_MASSIMI = 12_600_000L
-    private const val LATO_SEGMENTAZIONE = 768
-    private const val LATO_SFONDO = 480
-    private const val RAGGIO_SFOCATURA = 6
-    private const val PASSAGGI_SFOCATURA = 3
+
+    // Risoluzione (lato lungo) a cui si calcolano maschera e sfondo sfocato.
+    private const val LATO_LAVORO = 768
+
+    // Parametri provati su immagini di prova (vedi prototipo): bordo preciso, pochi aloni.
+    private const val RAGGIO_GUIDA = 16
+    private const val EPS_GUIDA = 1e-3f
+    private const val RAGGIO_SFOCATURA = 14
+    private const val RAGGIO_ESCLUSIONE = 5
 
     /** Riceve il JPEG originale e restituisce il JPEG con lo sfondo sfocato. */
     fun applica(jpeg: ByteArray): ByteArray {
         val originale = decodificaRaddrizzata(jpeg)
-        var maschera: Bitmap? = null
-        var sfondo: Bitmap? = null
+        var piccola: Bitmap? = null
+        var sfondoBmp: Bitmap? = null
+        var mascheraBmp: Bitmap? = null
         var risultato: Bitmap? = null
         try {
             val w = originale.width
             val h = originale.height
-            maschera = calcolaMaschera(originale)
-            sfondo = sfondoSfocato(originale)
+            val scala = LATO_LAVORO.toFloat() / maxOf(w, h)
+            val piccola0 = if (scala < 1f) {
+                Bitmap.createScaledBitmap(
+                    originale,
+                    (w * scala).toInt().coerceAtLeast(8),
+                    (h * scala).toInt().coerceAtLeast(8),
+                    true
+                )
+            } else {
+                originale
+            }
+            piccola = piccola0
+            val sw = piccola0.width
+            val sh = piccola0.height
+            val n = sw * sh
 
+            val pixel = IntArray(n)
+            piccola0.getPixels(pixel, 0, sw, 0, 0, sw, sh)
+            val rosso = FloatArray(n)
+            val verde = FloatArray(n)
+            val blu = FloatArray(n)
+            val luce = FloatArray(n)
+            for (i in 0 until n) {
+                val c = pixel[i]
+                rosso[i] = ((c shr 16) and 0xFF) / 255f
+                verde[i] = ((c shr 8) and 0xFF) / 255f
+                blu[i] = (c and 0xFF) / 255f
+                luce[i] = 0.299f * rosso[i] + 0.587f * verde[i] + 0.114f * blu[i]
+            }
+
+            // 1 + 2: maschera grossolana, poi bordo agganciato ai contorni della foto.
+            val grezza = confidenzaPersona(piccola0)
+            val guidata = filtroGuidato(luce, grezza, sw, sh, RAGGIO_GUIDA, EPS_GUIDA)
+            val alfa = FloatArray(n)
+            var soggetto = 0
+            for (i in 0 until n) {
+                alfa[i] = morbido(guidata[i], 0.35f, 0.65f)
+                if (alfa[i] > 0.5f) soggetto++
+            }
+            if (soggetto < n / 50) {
+                throw IllegalStateException("non ho riconosciuto nessuna persona nella foto")
+            }
+
+            // 3: sfondo sfocato senza contributo del soggetto (media pesata).
+            val vicinoSoggetto = media(alfa, sw, sh, RAGGIO_ESCLUSIONE)
+            val peso = FloatArray(n) { (1f - vicinoSoggetto[it] * 6f).coerceIn(0f, 1f) }
+            val pesoSfocato = media3(peso, sw, sh, RAGGIO_SFOCATURA)
+            val canali = arrayOf(rosso, verde, blu)
+            val sfocati = Array(3) { c ->
+                val pesata = FloatArray(n) { canali[c][it] * peso[it] }
+                media3(pesata, sw, sh, RAGGIO_SFOCATURA)
+            }
+            val coloriSfondo = IntArray(n)
+            val coloriMaschera = IntArray(n)
+            for (i in 0 until n) {
+                val d = maxOf(pesoSfocato[i], 1e-3f)
+                val r = (sfocati[0][i] / d).coerceIn(0f, 1f)
+                val g = (sfocati[1][i] / d).coerceIn(0f, 1f)
+                val b = (sfocati[2][i] / d).coerceIn(0f, 1f)
+                coloriSfondo[i] = (0xFF shl 24) or
+                    ((r * 255f + 0.5f).toInt() shl 16) or
+                    ((g * 255f + 0.5f).toInt() shl 8) or
+                    (b * 255f + 0.5f).toInt()
+                coloriMaschera[i] = (alfa[i] * 255f + 0.5f).toInt() shl 24
+            }
+            sfondoBmp = Bitmap.createBitmap(coloriSfondo, sw, sh, Bitmap.Config.ARGB_8888)
+            mascheraBmp = Bitmap.createBitmap(coloriMaschera, sw, sh, Bitmap.Config.ARGB_8888)
+
+            // 4: composizione a piena risoluzione.
             risultato = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val tela = Canvas(risultato)
             val area = Rect(0, 0, w, h)
-            tela.drawBitmap(sfondo, null, area, Paint(Paint.FILTER_BITMAP_FLAG))
-
-            // Strato col soggetto: foto originale ritagliata con la maschera, poi sovrapposta allo sfondo.
+            tela.drawBitmap(sfondoBmp, null, area, Paint(Paint.FILTER_BITMAP_FLAG))
             val strato = tela.saveLayer(0f, 0f, w.toFloat(), h.toFloat(), null)
             tela.drawBitmap(originale, 0f, 0f, null)
             val pennelloMaschera = Paint(Paint.FILTER_BITMAP_FLAG)
             pennelloMaschera.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
-            tela.drawBitmap(maschera, null, area, pennelloMaschera)
+            tela.drawBitmap(mascheraBmp, null, area, pennelloMaschera)
             tela.restoreToCount(strato)
 
             val uscita = ByteArrayOutputStream()
             risultato.compress(Bitmap.CompressFormat.JPEG, 95, uscita)
             return uscita.toByteArray()
         } finally {
-            maschera?.recycle()
-            sfondo?.recycle()
+            if (piccola !== originale) piccola?.recycle()
+            sfondoBmp?.recycle()
+            mascheraBmp?.recycle()
             risultato?.recycle()
             originale.recycle()
         }
     }
+
+    // --------------------------------------------------------
+    // Decodifica
+    // --------------------------------------------------------
 
     /** Decodifica il JPEG (ridotto se enorme) e lo ruota in verticale secondo l'EXIF. */
     private fun decodificaRaddrizzata(jpeg: ByteArray): Bitmap {
@@ -99,20 +178,12 @@ object SfocaturaSfondo {
         return ruotata
     }
 
-    /** Bitmap con trasparenza = quanto ogni punto appartiene alla persona (opaco = soggetto). */
-    private fun calcolaMaschera(origine: Bitmap): Bitmap {
-        val scala = LATO_SEGMENTAZIONE.toFloat() / maxOf(origine.width, origine.height)
-        val piccola = if (scala < 1f) {
-            Bitmap.createScaledBitmap(
-                origine,
-                (origine.width * scala).toInt().coerceAtLeast(1),
-                (origine.height * scala).toInt().coerceAtLeast(1),
-                true
-            )
-        } else {
-            origine
-        }
+    // --------------------------------------------------------
+    // Riconoscimento della persona (ML Kit)
+    // --------------------------------------------------------
 
+    /** Per ogni pixel di [immagine]: probabilità (0..1) che appartenga a una persona. */
+    private fun confidenzaPersona(immagine: Bitmap): FloatArray {
         val opzioni = SelfieSegmenterOptions.Builder()
             .setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE)
             .enableRawSizeMask()
@@ -122,7 +193,7 @@ object SfocaturaSfondo {
             val attesa = CountDownLatch(1)
             var ottenuta: SegmentationMask? = null
             var errore: Throwable? = null
-            segmentatore.process(InputImage.fromBitmap(piccola, 0))
+            segmentatore.process(InputImage.fromBitmap(immagine, 0))
                 .addOnSuccessListener {
                     ottenuta = it
                     attesa.countDown()
@@ -141,73 +212,85 @@ object SfocaturaSfondo {
             val mh = maschera.height
             val buffer = maschera.buffer
             buffer.rewind()
-            val colori = IntArray(mw * mh)
-            var soggetto = 0
-            for (i in colori.indices) {
-                val confidenza = buffer.getFloat()
-                // Curva morbida: sotto 0.35 è sfondo, sopra 0.75 è soggetto pieno.
-                val a = ((confidenza - 0.35f) / 0.4f).coerceIn(0f, 1f)
-                if (a > 0.5f) soggetto++
-                colori[i] = (a * 255f).toInt() shl 24
+            val dati = FloatArray(mw * mh)
+            for (i in dati.indices) dati[i] = buffer.getFloat()
+
+            val w = immagine.width
+            val h = immagine.height
+            if (mw == w && mh == h) return dati
+            // Dimensioni diverse: riporto la maschera alla misura dell'immagine (punto più vicino).
+            val uscita = FloatArray(w * h)
+            for (y in 0 until h) {
+                val sy = (y * mh / h).coerceAtMost(mh - 1)
+                for (x in 0 until w) {
+                    val sx = (x * mw / w).coerceAtMost(mw - 1)
+                    uscita[y * w + x] = dati[sy * mw + sx]
+                }
             }
-            if (soggetto < colori.size / 50) {
-                throw IllegalStateException("non ho riconosciuto nessuna persona nella foto")
-            }
-            return Bitmap.createBitmap(colori, mw, mh, Bitmap.Config.ARGB_8888)
+            return uscita
         } finally {
             segmentatore.close()
-            if (piccola !== origine) piccola.recycle()
         }
     }
 
-    /** Versione molto sfocata della foto (a bassa risoluzione: viene poi ingrandita in morbidezza). */
-    private fun sfondoSfocato(origine: Bitmap): Bitmap {
-        val scala = LATO_SFONDO.toFloat() / maxOf(origine.width, origine.height)
-        val sw = (origine.width * scala).toInt().coerceAtLeast(8)
-        val sh = (origine.height * scala).toInt().coerceAtLeast(8)
-        val piccola = Bitmap.createScaledBitmap(origine, sw, sh, true)
-        val pixel = IntArray(sw * sh)
-        piccola.getPixels(pixel, 0, sw, 0, 0, sw, sh)
-        if (piccola !== origine) piccola.recycle()
-        repeat(PASSAGGI_SFOCATURA) { sfocaBox(pixel, sw, sh, RAGGIO_SFOCATURA) }
-        return Bitmap.createBitmap(pixel, sw, sh, Bitmap.Config.ARGB_8888)
+    // --------------------------------------------------------
+    // Elaborazione dell'immagine (float, bordi replicati)
+    // --------------------------------------------------------
+
+    /** Passaggio da 0..1 con curva morbida tra [basso] e [alto]. */
+    private fun morbido(x: Float, basso: Float, alto: Float): Float {
+        val t = ((x - basso) / (alto - basso)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
     }
 
-    /** Sfocatura a scatola, prima in orizzontale e poi in verticale. */
-    private fun sfocaBox(pixel: IntArray, w: Int, h: Int, raggio: Int) {
-        val temp = IntArray(pixel.size)
-        val n = 2 * raggio + 1
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                var a = 0
-                var r = 0
-                var g = 0
-                var b = 0
-                for (k in -raggio..raggio) {
-                    val c = pixel[y * w + (x + k).coerceIn(0, w - 1)]
-                    a += c ushr 24
-                    r += (c shr 16) and 0xFF
-                    g += (c shr 8) and 0xFF
-                    b += c and 0xFF
-                }
-                temp[y * w + x] = ((a / n) shl 24) or ((r / n) shl 16) or ((g / n) shl 8) or (b / n)
-            }
+    /** Media mobile di raggio [r] su una linea di [n] valori. */
+    private fun mediaLinea(src: FloatArray, dst: FloatArray, inizio: Int, passo: Int, n: Int, r: Int) {
+        val fattore = 1.0 / (2 * r + 1)
+        var somma = 0.0
+        for (k in -r..r) somma += src[inizio + k.coerceIn(0, n - 1) * passo]
+        for (x in 0 until n) {
+            dst[inizio + x * passo] = (somma * fattore).toFloat()
+            somma += src[inizio + (x + r + 1).coerceAtMost(n - 1) * passo] -
+                src[inizio + (x - r).coerceAtLeast(0) * passo]
         }
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                var a = 0
-                var r = 0
-                var g = 0
-                var b = 0
-                for (k in -raggio..raggio) {
-                    val c = temp[(y + k).coerceIn(0, h - 1) * w + x]
-                    a += c ushr 24
-                    r += (c shr 16) and 0xFF
-                    g += (c shr 8) and 0xFF
-                    b += c and 0xFF
-                }
-                pixel[y * w + x] = ((a / n) shl 24) or ((r / n) shl 16) or ((g / n) shl 8) or (b / n)
-            }
+    }
+
+    /** Sfocatura a scatola (media su finestra quadrata di lato 2r+1). */
+    private fun media(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+        val temp = FloatArray(src.size)
+        val uscita = FloatArray(src.size)
+        for (y in 0 until h) mediaLinea(src, temp, y * w, 1, w, r)
+        for (x in 0 until w) mediaLinea(temp, uscita, x, w, h, r)
+        return uscita
+    }
+
+    /** Tre passaggi di sfocatura a scatola: approssimano una sfocatura gaussiana. */
+    private fun media3(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+        var a = src
+        repeat(3) { a = media(a, w, h, r) }
+        return a
+    }
+
+    /**
+     * Filtro guidato (He et al.): ritocca [input] in modo che i suoi bordi seguano quelli
+     * della [guida] (la luminosità della foto).
+     */
+    private fun filtroGuidato(guida: FloatArray, input: FloatArray, w: Int, h: Int, r: Int, eps: Float): FloatArray {
+        val n = guida.size
+        val mGuida = media(guida, w, h, r)
+        val mInput = media(input, w, h, r)
+        val corrIncrociata = media(FloatArray(n) { guida[it] * input[it] }, w, h, r)
+        val corrGuida = media(FloatArray(n) { guida[it] * guida[it] }, w, h, r)
+        val a = FloatArray(n)
+        val b = FloatArray(n)
+        for (i in 0 until n) {
+            val covarianza = corrIncrociata[i] - mGuida[i] * mInput[i]
+            val varianza = corrGuida[i] - mGuida[i] * mGuida[i]
+            a[i] = covarianza / (varianza + eps)
+            b[i] = mInput[i] - a[i] * mGuida[i]
         }
+        val mA = media(a, w, h, r)
+        val mB = media(b, w, h, r)
+        return FloatArray(n) { (mA[it] * guida[it] + mB[it]).coerceIn(0f, 1f) }
     }
 }
