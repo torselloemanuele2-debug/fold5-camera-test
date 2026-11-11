@@ -9,7 +9,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Typeface
-import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -35,12 +34,13 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : Activity() {
 
@@ -51,8 +51,23 @@ class MainActivity : Activity() {
     @Volatile
     private var running = false
 
+    private val logFile: File
+        get() = File(filesDir, "report.txt")
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Se l'app si chiude di colpo, salvo l'errore nel diario prima di morire.
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                val sw = StringWriter()
+                e.printStackTrace(PrintWriter(sw))
+                logFile.appendText("\n!!! CRASH !!!\n$sw\n")
+            } catch (_: Throwable) {
+            }
+            previous?.uncaughtException(t, e)
+        }
 
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -70,7 +85,25 @@ class MainActivity : Activity() {
         logView.typeface = Typeface.MONOSPACE
         logView.textSize = 12f
         logView.setTextIsSelectable(true)
-        logView.text = "Premi \"Avvia test fotocamere\". Il test dura circa 1 minuto."
+
+        // Mostro il diario della volta precedente, se esiste: se l'app era
+        // andata in crash, qui si vede l'ultimo passo raggiunto e l'errore.
+        val old = try {
+            if (logFile.exists()) logFile.readText() else ""
+        } catch (_: Throwable) {
+            ""
+        }
+        if (old.isNotBlank()) {
+            synchronized(report) {
+                report.append("### REPORT DELLA VOLTA PRECEDENTE ###\n")
+                report.append(old)
+                report.append("\n### FINE REPORT PRECEDENTE ###\n\n")
+                report.append("Premi \"Avvia test fotocamere\" per riprovare.\n")
+            }
+            logView.text = synchronized(report) { report.toString() }
+        } else {
+            logView.text = "Premi \"Avvia test fotocamere\". Il test dura circa 1 minuto."
+        }
 
         val scroll = ScrollView(this)
         scroll.addView(logView)
@@ -110,6 +143,11 @@ class MainActivity : Activity() {
 
     private fun log(s: String) {
         synchronized(report) { report.append(s).append('\n') }
+        // Scrivo subito ogni riga su file: se l'app muore, il diario resta.
+        try {
+            logFile.appendText(s + "\n")
+        } catch (_: Throwable) {
+        }
         uiHandler.post {
             logView.text = synchronized(report) { report.toString() }
         }
@@ -126,16 +164,27 @@ class MainActivity : Activity() {
         running = true
         startButton.isEnabled = false
         synchronized(report) { report.setLength(0) }
+        try {
+            logFile.delete()
+        } catch (_: Throwable) {
+        }
         Thread {
             try {
                 runAll()
             } catch (t: Throwable) {
-                log("ERRORE GENERALE: $t")
+                log("ERRORE GENERALE: ${describeError(t)}")
             }
             running = false
             uiHandler.post { startButton.isEnabled = true }
             log("\n=== TEST FINITO ===")
         }.start()
+    }
+
+    private fun describeError(t: Throwable): String {
+        val sw = StringWriter()
+        t.printStackTrace(PrintWriter(sw))
+        val lines = sw.toString().lines()
+        return lines.take(6).joinToString(" | ")
     }
 
     private fun runAll() {
@@ -177,7 +226,7 @@ class MainActivity : Activity() {
             val pc: CameraCharacteristics? = try {
                 manager.getCameraCharacteristics(pid)
             } catch (t: Throwable) {
-                log("  (il sistema non fornisce i dati di questo obiettivo: $t)")
+                log("  (il sistema non fornisce i dati di questo obiettivo: ${describeError(t)})")
                 null
             }
             if (pc != null) describe(pc, "  ")
@@ -253,6 +302,7 @@ class MainActivity : Activity() {
 
         try {
             // 1) Apro la fotocamera
+            log("  [1/6] apro la fotocamera...")
             val openLatch = CountDownLatch(1)
             var openError: String? = null
             manager.openCamera(logicalId, executor, object : CameraDevice.StateCallback() {
@@ -279,25 +329,26 @@ class MainActivity : Activity() {
             }
             val cam = camera!!
 
-            // 2) Preparo la ricezione delle immagini RAW
-            val rdr = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 4)
+            // 2) Preparo la ricezione delle immagini RAW.
+            // Le immagini arrivano in una coda; qualsiasi imprevisto viene
+            // annotato nel diario invece di far chiudere l'app.
+            log("  [2/6] preparo la ricezione delle immagini...")
+            val rdr = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 3)
             reader = rdr
-            val frameCount = AtomicInteger(0)
-            val wantStill = AtomicBoolean(false)
-            val stillQueue = LinkedBlockingQueue<Image>()
+            val queue = LinkedBlockingQueue<Image>(2)
             rdr.setOnImageAvailableListener({ r ->
-                val img = r.acquireNextImage()
-                if (img != null) {
-                    if (wantStill.get()) {
-                        stillQueue.offer(img)
-                    } else {
-                        frameCount.incrementAndGet()
+                try {
+                    val img = r.acquireNextImage()
+                    if (img != null && !queue.offer(img)) {
                         img.close()
                     }
+                } catch (t: Throwable) {
+                    log("  (avviso nella ricezione di un frame: $t)")
                 }
             }, handler)
 
             // 3) Apro la sessione, indicando (se serve) l'obiettivo fisico
+            log("  [3/6] apro la sessione di scatto...")
             val outCfg = OutputConfiguration(rdr.surface)
             if (physId != null) outCfg.setPhysicalCameraId(physId)
             val sessLatch = CountDownLatch(1)
@@ -325,23 +376,47 @@ class MainActivity : Activity() {
             }
             val sess = session!!
 
-            // 4) Riscaldamento: qualche frame perché l'esposizione automatica si assesti
-            val warm = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-            warm.addTarget(rdr.surface)
-            sess.setRepeatingRequest(warm.build(), null, handler)
-            val t0 = System.currentTimeMillis()
-            while (frameCount.get() < 20 && System.currentTimeMillis() - t0 < 6000) {
-                Thread.sleep(50)
+            // 4) Riscaldamento: alcuni scatti singoli, uno alla volta, perché
+            // l'esposizione automatica si assesti. Niente flusso continuo:
+            // è il punto che prima poteva far chiudere l'app.
+            log("  [4/6] scatti di riscaldamento...")
+            var warmOk = 0
+            for (i in 1..6) {
+                val done = CountDownLatch(1)
+                val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                req.addTarget(rdr.surface)
+                sess.capture(req.build(), object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(
+                        s: CameraCaptureSession,
+                        r: CaptureRequest,
+                        res: TotalCaptureResult
+                    ) {
+                        done.countDown()
+                    }
+
+                    override fun onCaptureFailed(
+                        s: CameraCaptureSession,
+                        r: CaptureRequest,
+                        f: CaptureFailure
+                    ) {
+                        done.countDown()
+                    }
+                }, handler)
+                done.await(4, TimeUnit.SECONDS)
+                val img = queue.poll(2, TimeUnit.SECONDS)
+                if (img != null) {
+                    warmOk++
+                    img.close()
+                }
             }
-            log("  Frame RAW ricevuti nel riscaldamento: ${frameCount.get()}")
-            if (frameCount.get() < 3) {
+            log("  Frame RAW ricevuti nel riscaldamento: $warmOk su 6")
+            if (warmOk == 0) {
                 log("  X Questo obiettivo non produce frame RAW.")
                 return
             }
-            sess.stopRepeating()
 
             // 5) Scatto vero e proprio
-            wantStill.set(true)
+            log("  [5/6] scatto vero e proprio...")
             val still = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
             still.addTarget(rdr.surface)
             val resLatch = CountDownLatch(1)
@@ -380,7 +455,7 @@ class MainActivity : Activity() {
             var image: Image? = null
             val t1 = System.currentTimeMillis()
             while (image == null && System.currentTimeMillis() - t1 < 8000) {
-                val img = stillQueue.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                val img = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
                 if (ts == null || img.timestamp == ts) {
                     image = img
                 } else {
@@ -395,6 +470,7 @@ class MainActivity : Activity() {
             val imgH = image.height
 
             // 6) Salvo il file DNG nella Galleria
+            log("  [6/6] salvo il file DNG...")
             val dngChars = chars ?: manager.getCameraCharacteristics(logicalId)
             val name = "raw_test_${label}_${System.currentTimeMillis()}.dng"
             val values = ContentValues()
@@ -407,16 +483,20 @@ class MainActivity : Activity() {
                 image.close()
                 return
             }
-            val out = contentResolver.openOutputStream(uri)
-            if (out == null) {
-                log("  X Non riesco a scrivere il file.")
+            try {
+                contentResolver.openOutputStream(uri).use { stream ->
+                    if (stream == null) {
+                        log("  X Non riesco a scrivere il file.")
+                    } else {
+                        val dng = DngCreator(dngChars, usedRes)
+                        dng.writeImage(stream, image)
+                        dng.close()
+                    }
+                }
+            } catch (t: Throwable) {
+                log("  X Errore nel salvataggio del DNG: ${describeError(t)}")
                 image.close()
                 return
-            }
-            out.use { stream ->
-                val dng = DngCreator(dngChars, usedRes)
-                dng.writeImage(stream, image)
-                dng.close()
             }
             image.close()
 
@@ -431,7 +511,7 @@ class MainActivity : Activity() {
             log("     obiettivo realmente attivo: ${active ?: "non indicato"}")
             log("     file: $name")
         } catch (t: Throwable) {
-            log("  X Errore: $t")
+            log("  X Errore: ${describeError(t)}")
         } finally {
             try {
                 session?.close()
