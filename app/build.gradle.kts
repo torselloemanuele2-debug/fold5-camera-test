@@ -11,8 +11,8 @@ android {
         applicationId = "it.camtest.fold"
         minSdk = 29
         targetSdk = 34
-        versionCode = 3
-        versionName = "2.1"
+        versionCode = 4
+        versionName = "2.2"
     }
 
     val chiave = rootProject.file("keystore.p12")

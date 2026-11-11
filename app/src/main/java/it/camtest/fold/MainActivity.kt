@@ -30,6 +30,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.provider.MediaStore
+import android.util.Size
 import android.view.Gravity
 import android.view.Surface
 import android.view.TextureView
@@ -463,6 +464,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var builderAnteprima: CaptureRequest.Builder? = null
     private var callbackAnteprima: CameraCaptureSession.CaptureCallback? = null
 
+    // Elaborazione del produttore (Camera Extensions): BOKEH per i ritratti, AUTOMATICO per il resto.
+    private var estesa: SessioneEstesa? = null
+    private var estesaChiave: String? = null
+    private var estensioniSupportate: List<Int> = emptyList()
+    @Volatile private var usaSamsung = false
+    private var tagliaAnteprimaNormale: Size? = null
+    private lateinit var bottoneMotore: Button
+
     private lateinit var cameraManager: CameraManager
     private var backId: String = "0"
     private val fisici = mutableMapOf<Lente, String?>()
@@ -515,6 +524,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         costruisciInterfaccia()
         rilevaLenti()
         aggiornaEtichettaLuce()
+        aggiornaEtichettaMotore()
 
         val vecchioCrash = try {
             if (logFile.exists()) logFile.readText() else ""
@@ -587,6 +597,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         bottonePiu.setOnClickListener { cambiaLuce(1) }
         rigaLuce.addView(bottonePiu, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(rigaLuce)
+
+        bottoneMotore = Button(this)
+        bottoneMotore.isAllCaps = false
+        bottoneMotore.setOnClickListener { cambiaMotore() }
+        root.addView(bottoneMotore, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         campoRicerca = EditText(this)
         campoRicerca.hint = "Cerca uno scenario (es. notte, ritratto, sport)..."
@@ -697,9 +712,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         bottoneScatta.isEnabled = cameraDevice != null
         // Porta subito l'anteprima sull'obiettivo dello scenario: quello che vedi è quello che scatti.
         if (cameraDevice != null && !inElaborazione) {
-            cameraHandler.post { configuraSessione(sc.lente) }
+            cameraHandler.post { preparaScenario(sc) }
         }
-        statoView.text = "Hai scelto: ${sc.nome}\nObiettivo: ${sc.lente}  Fuoco: ${sc.fuoco}\n${sc.consiglio}\n\nPremi Scatta quando sei pronto."
+        val notaMotore = if (usaSamsung) {
+            "\n[Motore Samsung: HDR, notte e ritratto li gestisce il telefono; tempo e ISO non sono regolabili]"
+        } else {
+            ""
+        }
+        statoView.text = "Hai scelto: ${sc.nome}\nObiettivo: ${sc.lente}  Fuoco: ${sc.fuoco}\n${sc.consiglio}$notaMotore\n\nPremi Scatta quando sei pronto."
         popolaLista(campoRicerca.text?.toString() ?: "")
     }
 
@@ -745,6 +765,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 ?: disponibili?.maxByOrNull { it.width.toLong() * it.height }
             if (taglia != null) {
                 surface.setDefaultBufferSize(taglia.width, taglia.height)
+                tagliaAnteprimaNormale = taglia
             }
         } catch (t: Throwable) {
             logFile.appendText("Errore impostazione dimensione anteprima: ${describeError(t)}\n")
@@ -806,6 +827,16 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 compPasso = passoComp
                 compIndice = Math.round(0.7f / passoComp).coerceIn(compMin, compMax)
             }
+
+            // Elaborazione del produttore (Camera Extensions), se il telefono la offre per questa fotocamera.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                estensioniSupportate = try {
+                    cameraManager.getCameraExtensionCharacteristics(backId).supportedExtensions
+                } catch (_: Throwable) {
+                    emptyList()
+                }
+            }
+            usaSamsung = estensioniSupportate.contains(0) || estensioniSupportate.contains(2)
 
             if (physIds.size >= 3) {
                 val conFocale = physIds.map { it to equivalenteMm(cameraManager.getCameraCharacteristics(it)) }
@@ -877,12 +908,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
     }
 
-    /** Deve essere chiamata dal thread della fotocamera. */
-    private fun configuraSessione(lente: Lente) {
-        val cam = cameraDevice ?: return
-        val anteprima = previewSurface ?: return
-        if (lente == lenteAttuale && session != null && sessionePronta) return
-
+    /** Chiude la sessione normale e il lettore JPEG, aspettando la conferma della fotocamera. */
+    private fun chiudiSessioneNormale() {
         sessionePronta = false
         val chiusuraPrecedente = chiusuraSessione
         try {
@@ -904,6 +931,16 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             jpegReader?.close()
         } catch (_: Throwable) {
         }
+    }
+
+    /** Deve essere chiamata dal thread della fotocamera. */
+    private fun configuraSessione(lente: Lente) {
+        val cam = cameraDevice ?: return
+        chiudiEstesaSeAttiva()
+        val anteprima = previewSurface ?: return
+        if (lente == lenteAttuale && session != null && sessionePronta) return
+
+        chiudiSessioneNormale()
 
         try {
             val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
@@ -1050,6 +1087,152 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     // --------------------------------------------------------
+    // Elaborazione Samsung (Camera Extensions)
+    // --------------------------------------------------------
+
+    private fun nomeMotore(estensione: Int): String = when (estensione) {
+        2 -> "BOKEH (sfondo sfocato)"
+        0 -> "AUTOMATICO (HDR/notte)"
+        else -> "ESTENSIONE $estensione"
+    }
+
+    private fun aggiornaEtichettaMotore() {
+        if (estensioniSupportate.isEmpty()) {
+            bottoneMotore.text = "Motore foto: MANUALE (elaborazione Samsung non disponibile)"
+            bottoneMotore.isEnabled = false
+        } else if (usaSamsung) {
+            bottoneMotore.text = "Motore foto: SAMSUNG (HDR, notte, ritratto vero) - tocca per il manuale"
+        } else {
+            bottoneMotore.text = "Motore foto: MANUALE (tempo e ISO per scenario) - tocca per Samsung"
+        }
+    }
+
+    private fun cambiaMotore() {
+        if (estensioniSupportate.isEmpty()) return
+        usaSamsung = !usaSamsung
+        aggiornaEtichettaMotore()
+        val sc = scenarioSelezionato
+        if (!inElaborazione) cameraHandler.post { preparaScenario(sc) }
+    }
+
+    /** Porta anteprima e fotocamera nel modo giusto per lo scenario. Thread della fotocamera. */
+    private fun preparaScenario(sc: Scenario?) {
+        if (sc != null && usaSamsung && configuraEstesa(sc)) return
+        configuraSessione(sc?.lente ?: Lente.PRINCIPALE)
+    }
+
+    /** Sposta l'anteprima su una nuova dimensione (le sessioni devono essere già chiuse). */
+    private fun portaAnteprimaA(taglia: Size?): Surface? {
+        val texture = textureView.surfaceTexture ?: return previewSurface
+        if (taglia != null) texture.setDefaultBufferSize(taglia.width, taglia.height)
+        val nuova = Surface(texture)
+        try {
+            previewSurface?.release()
+        } catch (_: Throwable) {
+        }
+        previewSurface = nuova
+        return nuova
+    }
+
+    private fun chiudiEstesaSeAttiva() {
+        val e = estesa ?: return
+        e.chiudi()
+        estesa = null
+        estesaChiave = null
+        portaAnteprimaA(tagliaAnteprimaNormale)
+    }
+
+    /** Zoom che avvicina l'obiettivo voluto quando non si può scegliere la lente fisica. */
+    private fun zoomPerLente(lente: Lente): Float? {
+        val trovato = try {
+            cameraManager.getCameraCharacteristics(backId).get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE)
+        } catch (_: Throwable) {
+            null
+        }
+        val intervallo = trovato ?: return null
+        return when (lente) {
+            Lente.ULTRA -> if (intervallo.lower < 1f) intervallo.lower else null
+            Lente.PRINCIPALE -> null
+            Lente.TELE -> if (intervallo.upper >= 3f) 3f else null
+        }
+    }
+
+    /**
+     * Avvia anteprima e scatto con l'elaborazione Samsung adatta allo scenario (BOKEH per i ritratti
+     * con sfondo sfocato, AUTOMATICO per il resto). Falso se non è possibile: si userà il motore manuale.
+     * Thread della fotocamera.
+     */
+    private fun configuraEstesa(sc: Scenario): Boolean {
+        val cam = cameraDevice ?: return false
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+        val tipo = if (sc.sfocaSfondo && estensioniSupportate.contains(2)) 2 else 0
+        if (!estensioniSupportate.contains(tipo)) return false
+
+        val esistente = estesa
+        val zoomVoluto = zoomPerLente(sc.lente)
+        val chiave = "$tipo|$zoomVoluto"
+        if (esistente != null && estesaChiave == chiave) return true
+
+        chiudiSessioneNormale()
+        lenteAttuale = null
+        esistente?.chiudi()
+        estesa = null
+        estesaChiave = null
+
+        val nuova = SessioneEstesa(cam, cameraManager, backId, callbackExecutor, callbackHandler)
+        try {
+            val superficie = portaAnteprimaA(nuova.tagliaAnteprima(tipo)) ?: return false
+            val zoom = if (zoomVoluto != null && nuova.supporta(tipo, CaptureRequest.CONTROL_ZOOM_RATIO)) zoomVoluto else null
+            val esito = nuova.apri(tipo, superficie, zoom, if (compPasso > 0f) compIndice else null)
+            if (esito.isNotEmpty()) throw IllegalStateException(esito)
+            estesa = nuova
+            estesaChiave = chiave
+
+            val nomeBreve = if (tipo == 2) "BOKEH" else "AUTO"
+            val testoZoom = when {
+                zoom != null -> String.format(Locale.ITALY, " · zoom %.1fx", zoom)
+                zoomVoluto != null -> " · zoom non disponibile"
+                else -> ""
+            }
+            uiHandler.post { mirino.etichetta = "SAMSUNG $nomeBreve$testoZoom · 4:3" }
+            return true
+        } catch (t: Throwable) {
+            nuova.chiudi()
+            portaAnteprimaA(tagliaAnteprimaNormale)
+            logFile.appendText("Elaborazione Samsung non avviata (${nomeMotore(tipo)}): ${describeError(t)}\n")
+            uiHandler.post {
+                statoView.text = statoView.text.toString() +
+                    "\n\nElaborazione Samsung non disponibile (${t.message ?: t.javaClass.simpleName}). Uso il motore manuale."
+            }
+            return false
+        }
+    }
+
+    private fun eseguiScattoEsteso(sc: Scenario, e: SessioneEstesa) {
+        uiHandler.post {
+            statoView.text = "Scatto con elaborazione Samsung: ${nomeMotore(e.estensione)}\n" +
+                "Può richiedere qualche secondo: tieni fermo il telefono."
+        }
+        val orientamento = orientamentoJpeg(cameraManager.getCameraCharacteristics(backId))
+        val bytes = e.scatta(orientamento, if (compPasso > 0f) compIndice else null, 30_000L)
+
+        val sloggiato = sc.nome.lowercase(Locale.ITALY)
+            .replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        val nome = salvaBytes(bytes, "${sloggiato}_${System.currentTimeMillis()}.jpg")
+        logFile.appendText("Scatto Samsung ${sc.nome}: ${nomeMotore(e.estensione)} zoom=${e.zoomUsato} -> $nome (${bytes.size / 1024} KB)\n")
+
+        val testo = buildString {
+            append("Scenario: ${sc.nome}\n")
+            append("Elaborazione Samsung: ${nomeMotore(e.estensione)}\n")
+            append("Zoom: ${e.zoomUsato ?: "1.0 (obiettivo principale)"}\n\n")
+            append("${sc.consiglio}\n\n")
+            if (nome.isNotEmpty()) append("Foto: $nome\n") else append("ATTENZIONE: salvataggio non riuscito\n")
+            append("\nCartella: Pictures/FotoScenari")
+        }
+        uiHandler.post { statoView.text = testo }
+    }
+
+    // --------------------------------------------------------
     // Luce (correzione dell'esposizione)
     // --------------------------------------------------------
 
@@ -1070,6 +1253,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     /** Rimanda alla fotocamera la richiesta d'anteprima con la luce aggiornata. Thread della fotocamera. */
     private fun aggiornaAnteprima() {
+        val e = estesa
+        if (e != null) {
+            e.aggiornaLuce(compIndice)
+            return
+        }
         val s = session ?: return
         val b = builderAnteprima ?: return
         val cb = callbackAnteprima ?: return
@@ -1212,6 +1400,13 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun eseguiScatto(sc: Scenario) {
+        if (usaSamsung && configuraEstesa(sc)) {
+            val e = estesa
+            if (e != null) {
+                eseguiScattoEsteso(sc, e)
+                return
+            }
+        }
         configuraSessione(sc.lente)
         val cam = cameraDevice ?: return
         val sess = session ?: return
@@ -1367,6 +1562,10 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun chiudiTutto() {
+        try {
+            estesa?.chiudi()
+        } catch (_: Throwable) {
+        }
         try {
             session?.close()
         } catch (_: Throwable) {
