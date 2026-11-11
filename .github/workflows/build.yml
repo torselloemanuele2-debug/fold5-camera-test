@@ -20,6 +20,17 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Prepara la firma fissa
+        run: |
+          if [ ! -f keystore.p12 ]; then
+            keytool -genkeypair -v -keystore keystore.p12 -storetype PKCS12 -storepass fotoscenari -alias fotoscenari -keypass fotoscenari -keyalg RSA -keysize 2048 -validity 10950 -dname "CN=FotoScenari"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add keystore.p12
+            git commit -m "Aggiunge la firma fissa generata dalla costruzione" -m "Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>" -m "Claude-Session: https://claude.ai/code/session_015ATFKPbFWBnusPfWMHiyqg"
+            git push
+          fi
+
       - name: Prepara Android SDK
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
