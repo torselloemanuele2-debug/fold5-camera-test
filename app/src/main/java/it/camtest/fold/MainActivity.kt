@@ -19,7 +19,6 @@ import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -461,14 +460,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var session: CameraCaptureSession? = null
     private var chiusuraSessione: CountDownLatch? = null
     private var lenteAttuale: Lente? = null
-    private var rawReader: ImageReader? = null
     private var jpegReader: ImageReader? = null
     private var previewSurface: Surface? = null
     private val cameraThread = HandlerThread("fotocamera").also { it.start() }
     private val cameraHandler = Handler(cameraThread.looper)
     private val cameraExecutor = Executor { r -> cameraHandler.post(r) }
 
-    private val codaRaw = LinkedBlockingQueue<Image>(2)
     private val codaJpeg = LinkedBlockingQueue<Image>(2)
 
     @Volatile private var ultimoExpoNs: Long = 1_000_000_000L / 50
@@ -648,7 +645,19 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private fun copiaReport() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("report", statoView.text.toString()))
+        val registroCompleto = try {
+            if (logFile.exists()) logFile.readText() else ""
+        } catch (_: Throwable) {
+            ""
+        }
+        val testoCompleto = buildString {
+            append(statoView.text.toString())
+            if (registroCompleto.isNotBlank()) {
+                append("\n\n=== REGISTRO COMPLETO (tutte le operazioni) ===\n")
+                append(registroCompleto)
+            }
+        }
+        cm.setPrimaryClip(ClipData.newPlainText("report", testoCompleto))
         Toast.makeText(this, "Report copiato", Toast.LENGTH_SHORT).show()
     }
 
@@ -815,10 +824,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         } catch (_: Throwable) {
         }
         try {
-            rawReader?.close()
-        } catch (_: Throwable) {
-        }
-        try {
             jpegReader?.close()
         } catch (_: Throwable) {
         }
@@ -826,18 +831,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         try {
             val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
             val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val rawSize = mappa?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
             val jpegSize = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
 
-            val nuovoRaw = if (rawSize != null) ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2) else null
             val nuovoJpeg = if (jpegSize != null) ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2) else null
-            nuovoRaw?.setOnImageAvailableListener({ r ->
-                try {
-                    val img = r.acquireNextImage()
-                    if (img != null && !codaRaw.offer(img)) img.close()
-                } catch (_: Throwable) {
-                }
-            }, cameraHandler)
             nuovoJpeg?.setOnImageAvailableListener({ r ->
                 try {
                     val img = r.acquireNextImage()
@@ -845,19 +841,19 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 } catch (_: Throwable) {
                 }
             }, cameraHandler)
-            rawReader = nuovoRaw
             jpegReader = nuovoJpeg
 
             val fisicoId = fisici[lente]
             val configAnteprima = OutputConfiguration(anteprima)
-            val configRaw = nuovoRaw?.let { OutputConfiguration(it.surface) }
             val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
+            // L'anteprima NON viene vincolata all'obiettivo fisico specifico: senza il RAW
+            // restano solo due flussi (anteprima + JPEG), ma si mantiene questa scelta per
+            // massima compatibilità. Il JPEG resta vincolato all'obiettivo corretto, quindi
+            // la foto finale è comunque quella giusta anche se per un istante l'anteprima non combacia.
             if (fisicoId != null) {
-                configAnteprima.setPhysicalCameraId(fisicoId)
-                configRaw?.setPhysicalCameraId(fisicoId)
                 configJpeg?.setPhysicalCameraId(fisicoId)
             }
-            val surfaces = listOfNotNull(configAnteprima, configRaw, configJpeg)
+            val surfaces = listOfNotNull(configAnteprima, configJpeg)
 
             val latch = CountDownLatch(1)
             val chiusuraNuova = CountDownLatch(1)
@@ -873,7 +869,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                                 latch.countDown()
                             }
                             override fun onConfigureFailed(s: CameraCaptureSession) {
-                                erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+RAW+JPEG per l'obiettivo $lente"
+                                erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+JPEG per l'obiettivo $lente"
                                 latch.countDown()
                             }
                             override fun onClosed(s: CameraCaptureSession) {
@@ -893,7 +889,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                     erroreCreazione.isNotEmpty() -> erroreCreazione
                     else -> "motivo sconosciuto"
                 }
-                logFile.appendText("Sessione non configurata (lente=$lente, raw=$rawSize, jpeg=$jpegSize): $motivo\n")
+                logFile.appendText("Sessione non configurata (lente=$lente, jpeg=$jpegSize): $motivo\n")
                 uiHandler.post {
                     statoView.text = "Non riesco ad avviare l'anteprima (obiettivo: $lente).\n$motivo\n\nPremi 'Copia report' e mandami il testo per sistemarlo."
                 }
@@ -947,7 +943,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         val cam = cameraDevice ?: return
         val sess = session ?: return
         val chars = caratteristiche[sc.lente] ?: cameraManager.getCameraCharacteristics(backId)
-        val rawR = rawReader
         val jpegR = jpegReader
 
         uiHandler.post { statoView.text = "Leggo la luce della scena..." }
@@ -976,7 +971,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         uiHandler.post { statoView.text = "Scatto in corso...\nTempo: 1/${(1_000_000_000.0 / risultato.tempoNs).roundToInt()} s   ISO: ${risultato.iso}" }
 
         val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-        rawR?.let { richiesta.addTarget(it.surface) }
         jpegR?.let { richiesta.addTarget(it.surface) }
         richiesta.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
         richiesta.set(CaptureRequest.SENSOR_EXPOSURE_TIME, risultato.tempoNs)
@@ -1011,18 +1005,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             .replace(Regex("[^a-z0-9]+"), "_").trim('_')
         val base = "${sloggiato}_${System.currentTimeMillis()}"
 
-        var nomeFileRaw = ""
-        if (rawR != null) {
-            var img: Image? = null
-            val fine = System.currentTimeMillis() + 4000
-            while (img == null && System.currentTimeMillis() < fine) {
-                val candidato = codaRaw.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                if (ts == null || candidato.timestamp == ts) img = candidato else candidato.close()
-            }
-            if (img != null) {
-                nomeFileRaw = salvaRaw(chars, res, img, "$base.dng")
-            }
-        }
         var nomeFileJpeg = ""
         if (jpegR != null) {
             var img: Image? = null
@@ -1043,7 +1025,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             append("Tempo di scatto: $expoText   ISO: ${risultato.iso}\n\n")
             append("${sc.consiglio}\n\n")
             if (nomeFileJpeg.isNotEmpty()) append("Foto: $nomeFileJpeg\n")
-            if (nomeFileRaw.isNotEmpty()) append("RAW: $nomeFileRaw\n")
             append("\nCartella: Pictures/FotoScenari")
         }
         uiHandler.post { statoView.text = testo }
@@ -1060,30 +1041,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             else -> 0
         }
         return (sensorOrientation - gradi + 360) % 360
-    }
-
-    private fun salvaRaw(chars: CameraCharacteristics, res: TotalCaptureResult, img: Image, nome: String): String {
-        return try {
-            val values = ContentValues()
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, nome)
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
-            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FotoScenari")
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return ""
-            contentResolver.openOutputStream(uri)?.use { stream ->
-                val dng = DngCreator(chars, res)
-                dng.writeImage(stream, img)
-                dng.close()
-            }
-            img.close()
-            nome
-        } catch (t: Throwable) {
-            logFile.appendText("Errore salvaRaw: ${describeError(t)}\n")
-            try {
-                img.close()
-            } catch (_: Throwable) {
-            }
-            ""
-        }
     }
 
     private fun salvaJpeg(img: Image, nome: String): String {
@@ -1116,10 +1073,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         try {
             cameraDevice?.close()
-        } catch (_: Throwable) {
-        }
-        try {
-            rawReader?.close()
         } catch (_: Throwable) {
         }
         try {
