@@ -652,6 +652,10 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun selezionaScenario(sc: Scenario) {
         scenarioSelezionato = sc
         bottoneScatta.isEnabled = cameraDevice != null
+        // Porta subito l'anteprima sull'obiettivo dello scenario: quello che vedi è quello che scatti.
+        if (cameraDevice != null && !inElaborazione) {
+            cameraHandler.post { configuraSessione(sc.lente) }
+        }
         statoView.text = "Hai scelto: ${sc.nome}\nObiettivo: ${sc.lente}  Fuoco: ${sc.fuoco}\n${sc.consiglio}\n\nPremi Scatta quando sei pronto."
         popolaLista(campoRicerca.text?.toString() ?: "")
     }
@@ -863,58 +867,81 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             jpegReader = nuovoJpeg
 
             val fisicoId = fisici[lente]
-            val configAnteprima = OutputConfiguration(anteprima)
-            val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
-            // L'anteprima NON viene vincolata all'obiettivo fisico specifico: senza il RAW
-            // restano solo due flussi (anteprima + JPEG), ma si mantiene questa scelta per
-            // massima compatibilità. Il JPEG resta vincolato all'obiettivo corretto, quindi
-            // la foto finale è comunque quella giusta anche se per un istante l'anteprima non combacia.
-            if (fisicoId != null) {
-                configJpeg?.setPhysicalCameraId(fisicoId)
-            }
-            val surfaces = listOfNotNull(configAnteprima, configJpeg)
+            // Primo tentativo: anteprima e JPEG sullo STESSO obiettivo fisico, così l'inquadratura
+            // che vedi coincide con la foto. Se il telefono rifiuta la combinazione, secondo tentativo:
+            // anteprima sull'obiettivo principale (logico) e solo il JPEG sull'obiettivo scelto.
+            val tentativi = if (fisicoId != null) listOf(true, false) else listOf(false)
+            var motivo = ""
+            var anteprimaFedele = false
+            for (fedele in tentativi) {
+                val configAnteprima = OutputConfiguration(anteprima)
+                val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
+                if (fisicoId != null) {
+                    configJpeg?.setPhysicalCameraId(fisicoId)
+                    if (fedele) configAnteprima.setPhysicalCameraId(fisicoId)
+                }
+                val surfaces = listOfNotNull(configAnteprima, configJpeg)
 
-            val latch = CountDownLatch(1)
-            val chiusuraNuova = CountDownLatch(1)
-            chiusuraSessione = chiusuraNuova
-            var erroreCreazione = ""
-            try {
-                cam.createCaptureSession(
-                    SessionConfiguration(
-                        SessionConfiguration.SESSION_REGULAR, surfaces, callbackExecutor,
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(s: CameraCaptureSession) {
-                                session = s
-                                latch.countDown()
+                val latch = CountDownLatch(1)
+                val chiusuraNuova = CountDownLatch(1)
+                chiusuraSessione = chiusuraNuova
+                var erroreCreazione = ""
+                try {
+                    cam.createCaptureSession(
+                        SessionConfiguration(
+                            SessionConfiguration.SESSION_REGULAR, surfaces, callbackExecutor,
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(s: CameraCaptureSession) {
+                                    session = s
+                                    latch.countDown()
+                                }
+                                override fun onConfigureFailed(s: CameraCaptureSession) {
+                                    erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+JPEG per l'obiettivo $lente"
+                                    latch.countDown()
+                                }
+                                override fun onClosed(s: CameraCaptureSession) {
+                                    chiusuraNuova.countDown()
+                                }
                             }
-                            override fun onConfigureFailed(s: CameraCaptureSession) {
-                                erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+JPEG per l'obiettivo $lente"
-                                latch.countDown()
-                            }
-                            override fun onClosed(s: CameraCaptureSession) {
-                                chiusuraNuova.countDown()
-                            }
-                        }
+                        )
                     )
-                )
-            } catch (t: Throwable) {
-                erroreCreazione = describeError(t)
-            }
-            val completata = latch.await(8, TimeUnit.SECONDS)
-            val sess = session
-            if (sess == null) {
-                val motivo = when {
+                } catch (t: Throwable) {
+                    erroreCreazione = describeError(t)
+                }
+                val completata = latch.await(8, TimeUnit.SECONDS)
+                if (session != null) {
+                    anteprimaFedele = fedele
+                    motivo = ""
+                    break
+                }
+                motivo = when {
                     !completata -> "tempo scaduto in attesa della fotocamera"
                     erroreCreazione.isNotEmpty() -> erroreCreazione
                     else -> "motivo sconosciuto"
                 }
-                logFile.appendText("Sessione non configurata (lente=$lente, jpeg=$jpegSize): $motivo\n")
+                logFile.appendText("Sessione non configurata (lente=$lente, anteprimaSuObiettivo=$fedele, jpeg=$jpegSize): $motivo\n")
+                if (!completata) break
+                try {
+                    chiusuraNuova.await(3, TimeUnit.SECONDS)
+                } catch (_: Throwable) {
+                }
+            }
+            val sess = session
+            if (sess == null) {
                 uiHandler.post {
                     statoView.text = "Non riesco ad avviare l'anteprima (obiettivo: $lente).\n$motivo\n\nPremi 'Copia report' e mandami il testo per sistemarlo."
                 }
                 return
             }
             lenteAttuale = lente
+            if (fisicoId != null && !anteprimaFedele) {
+                logFile.appendText("Anteprima sull'obiettivo principale: il telefono non accetta l'anteprima sull'obiettivo $lente\n")
+                uiHandler.post {
+                    statoView.text = statoView.text.toString() +
+                        "\n\nATTENZIONE: su questo telefono l'anteprima non può mostrare l'obiettivo $lente. " +
+                        "Vedi l'obiettivo principale, ma la foto esce dall'obiettivo $lente: l'inquadratura sarà diversa."
+                }
+            }
 
             val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             richiesta.addTarget(anteprima)
