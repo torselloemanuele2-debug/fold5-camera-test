@@ -7,12 +7,15 @@ import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
@@ -28,8 +31,14 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.provider.MediaStore
+import android.view.Gravity
+import android.view.Surface
+import android.view.TextureView
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -37,27 +46,444 @@ import android.widget.Toast
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 
-class MainActivity : Activity() {
+// ============================================================
+// MODELLO: come è fatto uno scenario fotografico
+// ============================================================
 
-    private lateinit var logView: TextView
-    private lateinit var startButton: Button
-    private val report = StringBuilder()
+enum class Lente { ULTRA, PRINCIPALE, TELE }
+
+enum class Fuoco { INFINITO, AUTOMATICO, VICINO }
+
+enum class Bilanciamento(val modo: Int) {
+    AUTO(CameraMetadata.CONTROL_AWB_MODE_AUTO),
+    LUCE_GIORNO(CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT),
+    NUVOLOSO(CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT),
+    OMBRA(CameraMetadata.CONTROL_AWB_MODE_SHADE),
+    INCANDESCENZA(CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT),
+    FLUORESCENTE(CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT)
+}
+
+data class Scenario(
+    val nome: String,
+    val categoria: String,
+    val lente: Lente,
+    val fuoco: Fuoco,
+    val bilanciamento: Bilanciamento = Bilanciamento.AUTO,
+    // Se impostato, il tempo di scatto è fisso (in secondi): l'ISO si adatta alla luce.
+    val tempoFisso: Double? = null,
+    // Se impostato, il tempo di scatto non supera questo valore (congela il movimento).
+    val velocitaMinima: Double? = null,
+    // Se impostato, il tempo di scatto non supera questo valore (limite per foto a mano libera).
+    val tempoMassimoManuale: Double? = null,
+    val isoMassimo: Int = 1600,
+    val consiglio: String,
+    val paroleChiave: List<String> = emptyList()
+)
+
+object Catalogo {
+    val tutti: List<Scenario> = listOf(
+        // --- NOTTE ---
+        Scenario(
+            "Scie di fari di notte", "Notte", Lente.PRINCIPALE, Fuoco.INFINITO,
+            tempoFisso = 3.0, isoMassimo = 400,
+            consiglio = "Appoggia il telefono su una superficie ferma o un treppiede: a mano libera, 3 secondi verranno mossi.",
+            paroleChiave = listOf("scie", "fari", "traffico", "auto", "strada")
+        ),
+        Scenario(
+            "Città di notte", "Notte", Lente.PRINCIPALE, Fuoco.INFINITO,
+            tempoMassimoManuale = 1.0 / 8, isoMassimo = 1600,
+            consiglio = "Tieni il telefono il più fermo possibile. Se l'immagine resta scura, avvicinati a una fonte di luce.",
+            paroleChiave = listOf("città", "skyline", "edifici", "sera")
+        ),
+        Scenario(
+            "Cielo stellato", "Notte", Lente.ULTRA, Fuoco.INFINITO,
+            tempoFisso = 10.0, isoMassimo = 3200,
+            consiglio = "Serve un appoggio fermo: telefono su un muretto, una roccia o un treppiede. Lontano dalle luci della città.",
+            paroleChiave = listOf("stelle", "cielo", "astrofotografia", "notte")
+        ),
+        Scenario(
+            "Fuochi d'artificio", "Notte", Lente.PRINCIPALE, Fuoco.INFINITO,
+            tempoFisso = 2.0, isoMassimo = 200,
+            consiglio = "Appoggia il telefono: 2 secondi a mano libera verranno mossi. Scatta un attimo prima dell'esplosione.",
+            paroleChiave = listOf("fuochi", "artificio", "capodanno", "festa")
+        ),
+        Scenario(
+            "Luna piena", "Notte", Lente.TELE, Fuoco.INFINITO,
+            velocitaMinima = 1.0 / 250, isoMassimo = 400,
+            consiglio = "La luna è luminosa: un tempo troppo lungo la farebbe diventare un disco bianco senza crateri.",
+            paroleChiave = listOf("luna", "astro")
+        ),
+        Scenario(
+            "Luci e decorazioni", "Notte", Lente.PRINCIPALE, Fuoco.VICINO,
+            tempoMassimoManuale = 1.0 / 15, isoMassimo = 1600,
+            consiglio = "Avvicinati alle luci per un effetto più intenso.",
+            paroleChiave = listOf("luci", "natale", "decorazioni", "albero")
+        ),
+
+        // --- MOVIMENTO ---
+        Scenario(
+            "Sport o animali in corsa", "Movimento", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            velocitaMinima = 1.0 / 1000, isoMassimo = 3200,
+            consiglio = "Tempo molto rapido per congelare il movimento: se la scena è buia l'immagine avrà più grana.",
+            paroleChiave = listOf("sport", "corsa", "animali", "veloce", "azione")
+        ),
+        Scenario(
+            "Bambini che giocano", "Movimento", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            velocitaMinima = 1.0 / 500, isoMassimo = 3200,
+            consiglio = "Tempo rapido per evitare sfocature da movimento improvviso.",
+            paroleChiave = listOf("bambini", "giochi", "movimento")
+        ),
+        Scenario(
+            "Acqua effetto seta (cascata/fontana)", "Movimento", Lente.PRINCIPALE, Fuoco.INFINITO,
+            tempoFisso = 1.0, isoMassimo = 100,
+            consiglio = "Serve un appoggio fermo. In pieno giorno l'immagine potrebbe risultare troppo chiara: provare in condizioni di luce non troppo intensa.",
+            paroleChiave = listOf("acqua", "cascata", "fontana", "seta", "lunga esposizione")
+        ),
+        Scenario(
+            "Panning (soggetto nitido, sfondo mosso)", "Movimento", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            tempoFisso = 1.0 / 30, isoMassimo = 800,
+            consiglio = "Segui il soggetto con il telefono durante lo scatto, muovendoti alla sua stessa velocità.",
+            paroleChiave = listOf("panning", "inseguimento", "ciclismo")
+        ),
+        Scenario(
+            "Onde del mare", "Movimento", Lente.PRINCIPALE, Fuoco.INFINITO,
+            tempoFisso = 0.5, isoMassimo = 200,
+            consiglio = "Appoggia il telefono per evitare il mosso.",
+            paroleChiave = listOf("mare", "onde", "spiaggia", "acqua")
+        ),
+        Scenario(
+            "Ciclisti o auto in movimento", "Movimento", Lente.TELE, Fuoco.AUTOMATICO,
+            velocitaMinima = 1.0 / 750, isoMassimo = 3200,
+            consiglio = "Tempo rapido con lo zoom: ogni piccolo movimento del telefono si nota di più.",
+            paroleChiave = listOf("ciclisti", "bici", "auto", "veicoli")
+        ),
+
+        // --- RITRATTO ---
+        Scenario(
+            "Ritratto con sfondo sfocato", "Ritratto", Lente.TELE, Fuoco.VICINO,
+            tempoMassimoManuale = 1.0 / 60, isoMassimo = 1600,
+            consiglio = "Metti distanza tra il soggetto e lo sfondo: più distante è lo sfondo, più risulterà sfocato.",
+            paroleChiave = listOf("ritratto", "bokeh", "sfocato", "sfondo")
+        ),
+        Scenario(
+            "Ritratto in controluce morbido", "Ritratto", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            tempoMassimoManuale = 1.0 / 30, isoMassimo = 800,
+            consiglio = "Metti il soggetto tra te e la luce (es. il sole basso): i contorni si illumineranno.",
+            paroleChiave = listOf("ritratto", "controluce", "soffuso")
+        ),
+        Scenario(
+            "Ritratto con luce da finestra", "Ritratto", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            bilanciamento = Bilanciamento.LUCE_GIORNO,
+            tempoMassimoManuale = 1.0 / 30, isoMassimo = 800,
+            consiglio = "Posiziona il soggetto di lato rispetto alla finestra per un'ombra naturale sul viso.",
+            paroleChiave = listOf("ritratto", "finestra", "luce naturale")
+        ),
+        Scenario(
+            "Ritratto serale con luci artificiali", "Ritratto", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            bilanciamento = Bilanciamento.INCANDESCENZA,
+            isoMassimo = 1600,
+            consiglio = "Il bilanciamento è impostato per luci calde: se la scena è illuminata al neon i colori potrebbero virare.",
+            paroleChiave = listOf("ritratto", "sera", "serata", "locale")
+        ),
+        Scenario(
+            "Selfie o foto di gruppo", "Ritratto", Lente.ULTRA, Fuoco.AUTOMATICO,
+            isoMassimo = 1600,
+            consiglio = "L'obiettivo largo fa stare tutti nell'inquadratura: tieni le persone vicine al centro per evitare deformazioni ai bordi.",
+            paroleChiave = listOf("selfie", "gruppo", "amici")
+        ),
+        Scenario(
+            "Ritratto d'atmosfera", "Ritratto", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 1600,
+            consiglio = "Buono anche per una successiva conversione in bianco e nero.",
+            paroleChiave = listOf("ritratto", "atmosfera", "drammatico")
+        ),
+
+        // --- PAESAGGIO ---
+        Scenario(
+            "Alba o tramonto", "Paesaggio", Lente.PRINCIPALE, Fuoco.INFINITO,
+            bilanciamento = Bilanciamento.LUCE_GIORNO,
+            tempoMassimoManuale = 1.0 / 60, isoMassimo = 200,
+            consiglio = "Punta verso il cielo più luminoso per non bruciare i colori del tramonto.",
+            paroleChiave = listOf("alba", "tramonto", "sole", "cielo")
+        ),
+        Scenario(
+            "Panorama ampio di giorno", "Paesaggio", Lente.ULTRA, Fuoco.INFINITO,
+            isoMassimo = 100,
+            consiglio = "L'obiettivo ultra grandangolare racchiude tutto il paesaggio in un solo scatto.",
+            paroleChiave = listOf("panorama", "paesaggio", "vista", "ampio")
+        ),
+        Scenario(
+            "Nebbia o foschia", "Paesaggio", Lente.PRINCIPALE, Fuoco.INFINITO,
+            bilanciamento = Bilanciamento.NUVOLOSO,
+            isoMassimo = 200,
+            consiglio = "La nebbia tende a rendere l'immagine piatta: cerca un soggetto in primo piano per dare profondità.",
+            paroleChiave = listOf("nebbia", "foschia", "bruma")
+        ),
+        Scenario(
+            "Montagna con neve", "Paesaggio", Lente.PRINCIPALE, Fuoco.INFINITO,
+            isoMassimo = 100,
+            consiglio = "La neve molto luminosa può ingannare l'esposizione: se il risultato è troppo scuro, scatta di nuovo più vicino a un'area meno chiara.",
+            paroleChiave = listOf("montagna", "neve", "inverno")
+        ),
+        Scenario(
+            "Architettura e edifici", "Paesaggio", Lente.ULTRA, Fuoco.INFINITO,
+            isoMassimo = 200,
+            consiglio = "Allontanati e usa il grandangolo per includere l'intera facciata senza deformazioni eccessive.",
+            paroleChiave = listOf("architettura", "edifici", "palazzo", "monumento")
+        ),
+        Scenario(
+            "Campagna o natura in piena luce", "Paesaggio", Lente.ULTRA, Fuoco.INFINITO,
+            isoMassimo = 100,
+            consiglio = "Luce abbondante: la qualità dell'immagine sarà ottima.",
+            paroleChiave = listOf("campagna", "natura", "verde", "prato")
+        ),
+
+        // --- VICINO / MACRO ---
+        Scenario(
+            "Fiori e piccoli dettagli", "Vicino", Lente.PRINCIPALE, Fuoco.VICINO,
+            tempoMassimoManuale = 1.0 / 30, isoMassimo = 800,
+            consiglio = "Avvicinati lentamente finché l'immagine non è a fuoco: un leggero movimento del telefono aiuta a trovare la distanza giusta.",
+            paroleChiave = listOf("fiori", "macro", "dettaglio", "piccolo")
+        ),
+        Scenario(
+            "Cibo al ristorante", "Vicino", Lente.PRINCIPALE, Fuoco.VICINO,
+            isoMassimo = 1600,
+            consiglio = "Avvicinati al piatto e, se possibile, usa la luce naturale di una finestra vicina.",
+            paroleChiave = listOf("cibo", "piatto", "ristorante", "food")
+        ),
+        Scenario(
+            "Oggetti o prodotti da vendere", "Vicino", Lente.PRINCIPALE, Fuoco.VICINO,
+            bilanciamento = Bilanciamento.LUCE_GIORNO,
+            isoMassimo = 400,
+            consiglio = "Usa uno sfondo semplice e una luce uniforme per far risaltare l'oggetto.",
+            paroleChiave = listOf("prodotto", "oggetto", "vendita", "annuncio")
+        ),
+        Scenario(
+            "Insetti o dettagli naturali", "Vicino", Lente.PRINCIPALE, Fuoco.VICINO,
+            velocitaMinima = 1.0 / 125, isoMassimo = 1600,
+            consiglio = "Tempo abbastanza rapido perché i piccoli soggetti si muovono spesso all'improvviso.",
+            paroleChiave = listOf("insetti", "farfalla", "natura", "dettaglio")
+        ),
+        Scenario(
+            "Testo o documenti", "Vicino", Lente.PRINCIPALE, Fuoco.VICINO,
+            isoMassimo = 400, tempoMassimoManuale = 1.0 / 50,
+            consiglio = "Tieni il foglio ben illuminato e il telefono parallelo al testo per evitare sfocature ai bordi.",
+            paroleChiave = listOf("documento", "testo", "foglio", "scansione")
+        ),
+
+        // --- SITUAZIONI DIFFICILI ---
+        Scenario(
+            "Concerto o palco", "Situazioni difficili", Lente.TELE, Fuoco.AUTOMATICO,
+            velocitaMinima = 1.0 / 60, isoMassimo = 3200,
+            consiglio = "Luce scarsa e in movimento: l'immagine avrà più grana ma il soggetto resterà leggibile.",
+            paroleChiave = listOf("concerto", "palco", "musica", "spettacolo")
+        ),
+        Scenario(
+            "Interni di chiesa o museo", "Situazioni difficili", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 1600, tempoMassimoManuale = 1.0 / 15,
+            consiglio = "Appoggiati a una colonna o a un muro per tenere il telefono più fermo possibile.",
+            paroleChiave = listOf("chiesa", "museo", "interno", "monumento")
+        ),
+        Scenario(
+            "Spiaggia a mezzogiorno", "Situazioni difficili", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 100,
+            consiglio = "Luce fortissima: occhio ai riflessi sull'acqua e sulla sabbia che possono ingannare l'esposizione.",
+            paroleChiave = listOf("spiaggia", "mare", "sole", "estate")
+        ),
+        Scenario(
+            "Neve piena di sole", "Situazioni difficili", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 100,
+            consiglio = "Come per la spiaggia, la superficie chiarissima può confondere la misurazione automatica della luce.",
+            paroleChiave = listOf("neve", "sole", "inverno", "bianco")
+        ),
+        Scenario(
+            "Attraverso vetro o vetrina", "Situazioni difficili", Lente.PRINCIPALE, Fuoco.VICINO,
+            isoMassimo = 1600,
+            consiglio = "Avvicina l'obiettivo del telefono il più possibile al vetro per ridurre i riflessi.",
+            paroleChiave = listOf("vetro", "vetrina", "acquario", "finestra")
+        ),
+        Scenario(
+            "Controluce forte (sole in camera)", "Situazioni difficili", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 200,
+            consiglio = "Se possibile, fai in modo che un elemento della scena (un ramo, un edificio) copra parzialmente il sole.",
+            paroleChiave = listOf("controluce", "sole", "bagliore")
+        ),
+        Scenario(
+            "Teatro o sala buia con palco illuminato", "Situazioni difficili", Lente.TELE, Fuoco.AUTOMATICO,
+            velocitaMinima = 1.0 / 60, isoMassimo = 3200,
+            consiglio = "Il forte contrasto tra palco illuminato e sala buia è normale: l'esposizione privilegia il palco.",
+            paroleChiave = listOf("teatro", "spettacolo", "palco", "sala")
+        ),
+        Scenario(
+            "Interno di auto o aereo", "Situazioni difficili", Lente.ULTRA, Fuoco.AUTOMATICO,
+            isoMassimo = 3200, tempoMassimoManuale = 1.0 / 20,
+            consiglio = "Spazio stretto e poca luce: il grandangolo aiuta a inquadrare tutto l'interno.",
+            paroleChiave = listOf("auto", "aereo", "treno", "interno")
+        ),
+
+        // --- CREATIVO / ALTRO ---
+        Scenario(
+            "Nuvole in movimento di giorno", "Creativo", Lente.ULTRA, Fuoco.INFINITO,
+            tempoFisso = 0.5, isoMassimo = 50,
+            consiglio = "Serve un appoggio fermo. In piena luce diurna l'immagine potrebbe venire troppo chiara: provare con cielo nuvoloso o luce non intensa.",
+            paroleChiave = listOf("nuvole", "cielo", "lunga esposizione", "diurna")
+        ),
+        Scenario(
+            "Silhouette al tramonto", "Creativo", Lente.PRINCIPALE, Fuoco.INFINITO,
+            isoMassimo = 100,
+            consiglio = "Inquadra il soggetto davanti al cielo più luminoso: diventerà una sagoma scura ben definita.",
+            paroleChiave = listOf("silhouette", "sagoma", "controluce", "tramonto")
+        ),
+        Scenario(
+            "Riflessi su acqua calma", "Creativo", Lente.PRINCIPALE, Fuoco.INFINITO,
+            isoMassimo = 200,
+            consiglio = "Avvicinati alla superficie dell'acqua per un riflesso più ampio e nitido.",
+            paroleChiave = listOf("riflesso", "acqua", "lago", "specchio")
+        ),
+        Scenario(
+            "Fotografare uno schermo o una TV", "Creativo", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            tempoFisso = 1.0 / 50, isoMassimo = 1600,
+            consiglio = "Tempo scelto per ridurre le bande scure che si formano fotografando gli schermi.",
+            paroleChiave = listOf("schermo", "tv", "monitor", "proiezione")
+        ),
+        Scenario(
+            "Luci al neon colorate di sera", "Creativo", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 1600,
+            consiglio = "Lascia che i colori delle insegne restino saturi: evita di avvicinarti troppo a una sola luce.",
+            paroleChiave = listOf("neon", "insegne", "colori", "sera")
+        ),
+        Scenario(
+            "Pioggia su un vetro", "Creativo", Lente.PRINCIPALE, Fuoco.VICINO,
+            isoMassimo = 800,
+            consiglio = "Metti a fuoco le gocce più vicine: lo sfondo resterà naturalmente sfocato.",
+            paroleChiave = listOf("pioggia", "gocce", "vetro", "maltempo")
+        ),
+        Scenario(
+            "Falò o candele", "Creativo", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            bilanciamento = Bilanciamento.INCANDESCENZA,
+            tempoMassimoManuale = 1.0 / 10, isoMassimo = 1600,
+            consiglio = "La fiamma è molto più luminosa di quanto sembri: avvicinati senza farla diventare un'area bianca.",
+            paroleChiave = listOf("falò", "candele", "fuoco", "fiamma")
+        ),
+        Scenario(
+            "Interno con luce mista (negozio, ufficio)", "Creativo", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 800,
+            consiglio = "Con luci di tipo diverso nella stessa scena, i colori possono risultare leggermente innaturali: è normale.",
+            paroleChiave = listOf("negozio", "ufficio", "interno", "lavoro")
+        ),
+        Scenario(
+            "Non so, scelta automatica intelligente", "Creativo", Lente.PRINCIPALE, Fuoco.AUTOMATICO,
+            isoMassimo = 1600,
+            consiglio = "Impostazioni vicine a quelle automatiche, con un leggero margine di sicurezza contro il mosso.",
+            paroleChiave = listOf("automatico", "non so", "generico", "qualsiasi")
+        )
+    )
+}
+
+// ============================================================
+// MOTORE: calcola i valori adatti alla luce reale misurata
+// ============================================================
+
+object Solver {
+    data class Risultato(val tempoNs: Long, val iso: Int)
+
+    fun risolvi(
+        scenario: Scenario,
+        autoExpoNs: Long,
+        autoIso: Int,
+        expoMinNs: Long,
+        expoMaxNs: Long,
+        isoMinDispositivo: Int,
+        isoMaxDispositivo: Int
+    ): Risultato {
+        val autoExpoS = autoExpoNs / 1_000_000_000.0
+        val isoBase = autoIso.coerceAtLeast(1)
+        // Quantità di luce che la misurazione automatica ritiene corretta.
+        val prodottoAuto = autoExpoS * isoBase
+
+        var tempoTarget = when {
+            scenario.tempoFisso != null -> scenario.tempoFisso
+            scenario.velocitaMinima != null -> minOf(autoExpoS, scenario.velocitaMinima)
+            scenario.tempoMassimoManuale != null -> minOf(autoExpoS, scenario.tempoMassimoManuale)
+            else -> autoExpoS
+        }
+        if (tempoTarget <= 0.0) tempoTarget = autoExpoS.coerceAtLeast(1.0 / 1000)
+
+        var isoTarget = (prodottoAuto / tempoTarget).roundToInt()
+
+        if (isoTarget > scenario.isoMassimo) {
+            if (scenario.tempoFisso == null) {
+                // Allunga il tempo per restare entro l'ISO massimo dello scenario,
+                // ma senza superare eventuali vincoli di velocità minima o tempo massimo.
+                val tempoAllungato = prodottoAuto / scenario.isoMassimo
+                val limite = scenario.velocitaMinima ?: scenario.tempoMassimoManuale
+                tempoTarget = if (limite != null) minOf(tempoAllungato, maxOf(tempoTarget, limite * 8)) else tempoAllungato
+                isoTarget = (prodottoAuto / tempoTarget).roundToInt().coerceAtMost(scenario.isoMassimo)
+            } else {
+                isoTarget = scenario.isoMassimo
+            }
+        }
+
+        isoTarget = isoTarget.coerceIn(isoMinDispositivo, isoMaxDispositivo)
+        var tempoNs = (tempoTarget * 1_000_000_000.0).toLong()
+        tempoNs = tempoNs.coerceIn(expoMinNs, expoMaxNs)
+
+        return Risultato(tempoNs, isoTarget)
+    }
+}
+
+// ============================================================
+// APP
+// ============================================================
+
+class MainActivity : Activity(), TextureView.SurfaceTextureListener {
+
     private val uiHandler = Handler(Looper.getMainLooper())
-    @Volatile
-    private var running = false
+    private lateinit var textureView: TextureView
+    private lateinit var campoRicerca: EditText
+    private lateinit var listaScenari: LinearLayout
+    private lateinit var statoView: TextView
+    private lateinit var bottoneScatta: Button
 
-    private val logFile: File
-        get() = File(filesDir, "report.txt")
+    private lateinit var cameraManager: CameraManager
+    private var backId: String = "0"
+    private val fisici = mutableMapOf<Lente, String?>()
+    private val caratteristiche = mutableMapOf<Lente, CameraCharacteristics>()
+
+    private var cameraDevice: CameraDevice? = null
+    private var session: CameraCaptureSession? = null
+    private var lenteAttuale: Lente? = null
+    private var rawReader: ImageReader? = null
+    private var jpegReader: ImageReader? = null
+    private var previewSurface: Surface? = null
+    private val cameraThread = HandlerThread("fotocamera").also { it.start() }
+    private val cameraHandler = Handler(cameraThread.looper)
+    private val cameraExecutor = Executor { r -> cameraHandler.post(r) }
+
+    private val codaRaw = LinkedBlockingQueue<Image>(2)
+    private val codaJpeg = LinkedBlockingQueue<Image>(2)
+
+    @Volatile private var ultimoExpoNs: Long = 1_000_000_000L / 50
+    @Volatile private var ultimoIso: Int = 200
+    @Volatile private var ultimoAfState: Int? = null
+    @Volatile private var ultimoFocusDistance: Float = 0f
+    @Volatile private var sessionePronta = false
+
+    private var scenarioSelezionato: Scenario? = null
+    @Volatile private var inElaborazione = false
+
+    private val logFile: File get() = File(filesDir, "report_scenari.txt")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Se l'app si chiude di colpo, salvo l'errore nel diario prima di morire.
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             try {
@@ -69,468 +495,597 @@ class MainActivity : Activity() {
             previous?.uncaughtException(t, e)
         }
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(24, 64, 24, 24)
+        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
-        startButton = Button(this)
-        startButton.text = "Avvia test fotocamere"
-        startButton.setOnClickListener { onStartClicked() }
+        costruisciInterfaccia()
+        rilevaLenti()
 
-        val copyButton = Button(this)
-        copyButton.text = "Copia report"
-        copyButton.setOnClickListener { copyReport() }
-
-        logView = TextView(this)
-        logView.typeface = Typeface.MONOSPACE
-        logView.textSize = 12f
-        logView.setTextIsSelectable(true)
-
-        // Mostro il diario della volta precedente, se esiste: se l'app era
-        // andata in crash, qui si vede l'ultimo passo raggiunto e l'errore.
-        val old = try {
+        val vecchioCrash = try {
             if (logFile.exists()) logFile.readText() else ""
         } catch (_: Throwable) {
             ""
         }
-        if (old.isNotBlank()) {
-            synchronized(report) {
-                report.append("### REPORT DELLA VOLTA PRECEDENTE ###\n")
-                report.append(old)
-                report.append("\n### FINE REPORT PRECEDENTE ###\n\n")
-                report.append("Premi \"Avvia test fotocamere\" per riprovare.\n")
-            }
-            logView.text = synchronized(report) { report.toString() }
-        } else {
-            logView.text = "VERSIONE 3. Premi \"Avvia test fotocamere\". Il test dura circa 1 minuto."
+        if (vecchioCrash.contains("CRASH")) {
+            statoView.text = "### ERRORE DELLA VOLTA PRECEDENTE ###\n$vecchioCrash"
         }
-
-        val scroll = ScrollView(this)
-        scroll.addView(logView)
-
-        root.addView(startButton)
-        root.addView(copyButton)
-        root.addView(
-            scroll,
-            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        )
-        setContentView(root)
     }
 
-    private fun onStartClicked() {
-        if (running) return
+    override fun onDestroy() {
+        super.onDestroy()
+        chiudiTutto()
+        cameraThread.quitSafely()
+    }
+
+    // --------------------------------------------------------
+    // Interfaccia
+    // --------------------------------------------------------
+
+    private fun costruisciInterfaccia() {
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+
+        val larghezzaSchermo = resources.displayMetrics.widthPixels
+        val altezzaPreview = (larghezzaSchermo * 4 / 3)
+
+        val contenitorePreview = FrameLayout(this)
+        contenitorePreview.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, altezzaPreview
+        )
+        textureView = TextureView(this)
+        textureView.surfaceTextureListener = this
+        contenitorePreview.addView(
+            textureView,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        root.addView(contenitorePreview)
+
+        campoRicerca = EditText(this)
+        campoRicerca.hint = "Cerca uno scenario (es. notte, ritratto, sport)..."
+        campoRicerca.setPadding(24, 16, 24, 16)
+        root.addView(campoRicerca, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        listaScenari = LinearLayout(this)
+        listaScenari.orientation = LinearLayout.VERTICAL
+        listaScenari.setPadding(16, 8, 16, 8)
+        val scroll = ScrollView(this)
+        scroll.addView(listaScenari)
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        statoView = TextView(this)
+        statoView.typeface = Typeface.MONOSPACE
+        statoView.textSize = 12f
+        statoView.setPadding(24, 8, 24, 8)
+        statoView.setTextIsSelectable(true)
+        statoView.text = "Scegli uno scenario dalla lista, poi premi Scatta."
+        root.addView(statoView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val rigaBottoni = LinearLayout(this)
+        rigaBottoni.orientation = LinearLayout.HORIZONTAL
+
+        bottoneScatta = Button(this)
+        bottoneScatta.text = "Scatta"
+        bottoneScatta.isEnabled = false
+        bottoneScatta.setOnClickListener { avviaScatto() }
+        rigaBottoni.addView(bottoneScatta, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val bottoneCopia = Button(this)
+        bottoneCopia.text = "Copia report"
+        bottoneCopia.setOnClickListener { copiaReport() }
+        rigaBottoni.addView(bottoneCopia, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        root.addView(rigaBottoni)
+
+        setContentView(root)
+
+        campoRicerca.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(s: android.text.Editable?) {
+                popolaLista(s?.toString() ?: "")
+            }
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+        })
+
+        popolaLista("")
+
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
-            return
         }
-        startTest()
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1 && grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            startTest()
+        if (requestCode == 1 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            if (textureView.isAvailable) apriFotocamera()
         } else {
-            log("Permesso fotocamera negato: senza non si può fare il test.")
+            statoView.text = "Serve il permesso della fotocamera per usare l'app."
         }
     }
 
-    private fun log(s: String) {
-        synchronized(report) { report.append(s).append('\n') }
-        // Scrivo subito ogni riga su file: se l'app muore, il diario resta.
-        try {
-            logFile.appendText(s + "\n")
-        } catch (_: Throwable) {
+    private fun popolaLista(filtro: String) {
+        listaScenari.removeAllViews()
+        val f = filtro.trim().lowercase(Locale.ITALY)
+        val visibili = Catalogo.tutti.filter { sc ->
+            f.isEmpty() ||
+                sc.nome.lowercase(Locale.ITALY).contains(f) ||
+                sc.categoria.lowercase(Locale.ITALY).contains(f) ||
+                sc.paroleChiave.any { it.lowercase(Locale.ITALY).contains(f) }
         }
-        uiHandler.post {
-            logView.text = synchronized(report) { report.toString() }
-        }
-    }
-
-    private fun copyReport() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = synchronized(report) { report.toString() }
-        cm.setPrimaryClip(ClipData.newPlainText("report", text))
-        Toast.makeText(this, "Report copiato", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun startTest() {
-        running = true
-        startButton.isEnabled = false
-        synchronized(report) { report.setLength(0) }
-        try {
-            logFile.delete()
-        } catch (_: Throwable) {
-        }
-        Thread {
-            try {
-                runAll()
-            } catch (t: Throwable) {
-                log("ERRORE GENERALE: ${describeError(t)}")
+        var categoriaCorrente = ""
+        for (sc in visibili) {
+            if (sc.categoria != categoriaCorrente) {
+                categoriaCorrente = sc.categoria
+                val intestazione = TextView(this)
+                intestazione.text = categoriaCorrente
+                intestazione.setTypeface(null, Typeface.BOLD)
+                intestazione.setPadding(8, 24, 8, 8)
+                listaScenari.addView(intestazione)
             }
-            running = false
-            uiHandler.post { startButton.isEnabled = true }
-            log("\n=== TEST FINITO ===")
-        }.start()
+            val bottone = Button(this)
+            bottone.text = sc.nome
+            bottone.isAllCaps = false
+            bottone.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            if (sc == scenarioSelezionato) {
+                bottone.setBackgroundColor(Color.parseColor("#D0E8FF"))
+            }
+            bottone.setOnClickListener { selezionaScenario(sc) }
+            listaScenari.addView(bottone, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        if (visibili.isEmpty()) {
+            val vuoto = TextView(this)
+            vuoto.text = "Nessuno scenario trovato."
+            vuoto.setPadding(8, 24, 8, 8)
+            listaScenari.addView(vuoto)
+        }
+    }
+
+    private fun selezionaScenario(sc: Scenario) {
+        scenarioSelezionato = sc
+        bottoneScatta.isEnabled = cameraDevice != null
+        statoView.text = "Hai scelto: ${sc.nome}\nObiettivo: ${sc.lente}  Fuoco: ${sc.fuoco}\n${sc.consiglio}\n\nPremi Scatta quando sei pronto."
+        popolaLista(campoRicerca.text?.toString() ?: "")
+    }
+
+    private fun copiaReport() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("report", statoView.text.toString()))
+        Toast.makeText(this, "Report copiato", Toast.LENGTH_SHORT).show()
     }
 
     private fun describeError(t: Throwable): String {
         val sw = StringWriter()
         t.printStackTrace(PrintWriter(sw))
-        val lines = sw.toString().lines()
-        return lines.take(6).joinToString(" | ")
+        return sw.toString().lines().take(6).joinToString(" | ")
     }
 
-    private fun runAll() {
-        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        log("Test VERSIONE 3")
-        log("Telefono: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+    // --------------------------------------------------------
+    // TextureView
+    // --------------------------------------------------------
 
-        val ids = manager.cameraIdList
-        log("Fotocamere visibili al sistema: ${ids.joinToString()}")
-
-        var backLogical: String? = null
-        for (id in ids) {
-            val c = manager.getCameraCharacteristics(id)
-            val facing = when (c.get(CameraCharacteristics.LENS_FACING)) {
-                CameraCharacteristics.LENS_FACING_BACK -> "POSTERIORE"
-                CameraCharacteristics.LENS_FACING_FRONT -> "FRONTALE"
-                else -> "ALTRA"
-            }
-            val phys = c.physicalCameraIds
-            log("- id $id: $facing, obiettivi fisici collegati: [${phys.joinToString()}]")
-            describe(c, "    ")
-            if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
-                phys.isNotEmpty() && backLogical == null
-            ) {
-                backLogical = id
-            }
+    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        previewSurface = Surface(surface)
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            apriFotocamera()
         }
+    }
 
-        val backId = backLogical ?: "0"
-        val logicalChars = manager.getCameraCharacteristics(backId)
-        val physIds = logicalChars.physicalCameraIds.sorted()
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
 
-        log("\n=== TEST FOTOCAMERA POSTERIORE (id $backId) ===")
+    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+        previewSurface = null
+        return true
+    }
 
-        log("\n--- Fotocamera principale (come la vede un'app normale) ---")
-        testCapture(manager, backId, null, null, "logica")
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
 
-        for (pid in physIds) {
-            log("\n--- Obiettivo fisico id $pid ---")
-            val pc: CameraCharacteristics? = try {
-                manager.getCameraCharacteristics(pid)
+    // --------------------------------------------------------
+    // Rilevamento obiettivi disponibili
+    // --------------------------------------------------------
+
+    private fun equivalenteMm(c: CameraCharacteristics): Double {
+        val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: return 23.0
+        val physSize = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE) ?: return focal.toDouble()
+        val diag = Math.sqrt((physSize.width * physSize.width + physSize.height * physSize.height).toDouble())
+        if (diag <= 0.0) return focal.toDouble()
+        return focal * 43.27 / diag
+    }
+
+    private fun rilevaLenti() {
+        try {
+            val ids = cameraManager.cameraIdList
+            var trovato: String? = null
+            for (id in ids) {
+                val c = cameraManager.getCameraCharacteristics(id)
+                if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK &&
+                    c.physicalCameraIds.isNotEmpty()
+                ) {
+                    trovato = id
+                    break
+                }
+            }
+            backId = trovato ?: ids.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: ids.first()
+
+            val logicalChars = cameraManager.getCameraCharacteristics(backId)
+            val physIds = logicalChars.physicalCameraIds.toList()
+
+            if (physIds.size >= 3) {
+                val conFocale = physIds.map { it to equivalenteMm(cameraManager.getCameraCharacteristics(it)) }
+                    .sortedBy { it.second }
+                val ultraId = conFocale.first().first
+                val teleId = conFocale.last().first
+                val principaleId = conFocale[conFocale.size / 2].first
+                fisici[Lente.ULTRA] = ultraId
+                fisici[Lente.PRINCIPALE] = principaleId
+                fisici[Lente.TELE] = teleId
+            } else if (physIds.size == 2) {
+                val conFocale = physIds.map { it to equivalenteMm(cameraManager.getCameraCharacteristics(it)) }
+                    .sortedBy { it.second }
+                fisici[Lente.ULTRA] = conFocale.first().first
+                fisici[Lente.TELE] = conFocale.last().first
+                fisici[Lente.PRINCIPALE] = null
+            } else {
+                fisici[Lente.ULTRA] = null
+                fisici[Lente.PRINCIPALE] = null
+                fisici[Lente.TELE] = null
+            }
+
+            for (l in Lente.values()) {
+                val fid = fisici[l]
+                caratteristiche[l] = if (fid != null) cameraManager.getCameraCharacteristics(fid) else logicalChars
+            }
+        } catch (t: Throwable) {
+            logFile.appendText("Errore rilevaLenti: ${describeError(t)}\n")
+        }
+    }
+
+    // --------------------------------------------------------
+    // Apertura fotocamera e sessione
+    // --------------------------------------------------------
+
+    private fun apriFotocamera() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
+        cameraHandler.post {
+            try {
+                val latch = CountDownLatch(1)
+                cameraManager.openCamera(backId, cameraExecutor, object : CameraDevice.StateCallback() {
+                    override fun onOpened(c: CameraDevice) {
+                        cameraDevice = c
+                        latch.countDown()
+                    }
+                    override fun onDisconnected(c: CameraDevice) {
+                        c.close()
+                        cameraDevice = null
+                    }
+                    override fun onError(c: CameraDevice, error: Int) {
+                        c.close()
+                        cameraDevice = null
+                        latch.countDown()
+                    }
+                })
+                latch.await(8, TimeUnit.SECONDS)
+                if (cameraDevice != null) {
+                    configuraSessione(Lente.PRINCIPALE)
+                    uiHandler.post {
+                        if (scenarioSelezionato != null) bottoneScatta.isEnabled = true
+                    }
+                } else {
+                    uiHandler.post { statoView.text = "Non riesco ad aprire la fotocamera. Riprova a riaprire l'app." }
+                }
             } catch (t: Throwable) {
-                log("  (il sistema non fornisce i dati di questo obiettivo: ${describeError(t)})")
-                null
+                logFile.appendText("Errore apertura fotocamera: ${describeError(t)}\n")
+                uiHandler.post { statoView.text = "Errore nell'apertura della fotocamera: ${describeError(t)}" }
             }
-            if (pc != null) describe(pc, "  ")
-            testCapture(manager, backId, pid, pc, "fisica$pid")
         }
-
-        log("\nI file DNG (RAW) sono nella Galleria, cartella Pictures/FoldRawTest.")
     }
 
-    private fun describe(c: CameraCharacteristics, ind: String) {
-        val level = when (c.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)) {
-            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
-            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL -> "FULL"
-            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LIMITED -> "LIMITED"
-            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_LEGACY -> "LEGACY"
-            CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL -> "EXTERNAL"
-            else -> "?"
-        }
-        log("${ind}livello accesso: $level")
+    /** Deve essere chiamata dal thread della fotocamera. */
+    private fun configuraSessione(lente: Lente) {
+        val cam = cameraDevice ?: return
+        val anteprima = previewSurface ?: return
+        if (lente == lenteAttuale && session != null && sessionePronta) return
 
-        val focal = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-        val physSize = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
-        if (focal != null && focal.isNotEmpty()) {
-            val f = focal[0]
-            var eq = ""
-            if (physSize != null) {
-                val w = physSize.width.toDouble()
-                val h = physSize.height.toDouble()
-                val diag = Math.sqrt(w * w + h * h)
-                eq = " (equivalente a circa ${Math.round(f * 43.27 / diag)}mm)"
+        sessionePronta = false
+        try {
+            session?.stopRepeating()
+        } catch (_: Throwable) {
+        }
+        try {
+            session?.close()
+        } catch (_: Throwable) {
+        }
+        session = null
+        try {
+            rawReader?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            jpegReader?.close()
+        } catch (_: Throwable) {
+        }
+
+        val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
+        val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val rawSize = mappa?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
+        val jpegSize = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
+
+        val nuovoRaw = if (rawSize != null) ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2) else null
+        val nuovoJpeg = if (jpegSize != null) ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2) else null
+        nuovoRaw?.setOnImageAvailableListener({ r ->
+            try {
+                val img = r.acquireNextImage()
+                if (img != null && !codaRaw.offer(img)) img.close()
+            } catch (_: Throwable) {
             }
-            log("${ind}lunghezza focale: ${f}mm$eq")
+        }, cameraHandler)
+        nuovoJpeg?.setOnImageAvailableListener({ r ->
+            try {
+                val img = r.acquireNextImage()
+                if (img != null && !codaJpeg.offer(img)) img.close()
+            } catch (_: Throwable) {
+            }
+        }, cameraHandler)
+        rawReader = nuovoRaw
+        jpegReader = nuovoJpeg
+
+        val fisicoId = fisici[lente]
+        val configAnteprima = OutputConfiguration(anteprima)
+        val configRaw = nuovoRaw?.let { OutputConfiguration(it.surface) }
+        val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
+        if (fisicoId != null) {
+            configAnteprima.setPhysicalCameraId(fisicoId)
+            configRaw?.setPhysicalCameraId(fisicoId)
+            configJpeg?.setPhysicalCameraId(fisicoId)
         }
+        val surfaces = listOfNotNull(configAnteprima, configRaw, configJpeg)
 
-        val pix = c.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
-        if (pix != null) log("${ind}sensore: ${pix.width}x${pix.height} pixel")
-
-        val raw = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
-        val rawText = if (raw == null || raw.isEmpty()) {
-            "non dichiarato"
-        } else {
-            raw.joinToString { "${it.width}x${it.height}" }
+        val latch = CountDownLatch(1)
+        try {
+            cam.createCaptureSession(
+                SessionConfiguration(
+                    SessionConfiguration.SESSION_REGULAR, surfaces, cameraExecutor,
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(s: CameraCaptureSession) {
+                            session = s
+                            latch.countDown()
+                        }
+                        override fun onConfigureFailed(s: CameraCaptureSession) {
+                            latch.countDown()
+                        }
+                    }
+                )
+            )
+        } catch (t: Throwable) {
+            logFile.appendText("Errore createCaptureSession: ${describeError(t)}\n")
         }
-        log("${ind}formati RAW: $rawText")
-    }
-
-    private fun testCapture(
-        manager: CameraManager,
-        logicalId: String,
-        physId: String?,
-        chars: CameraCharacteristics?,
-        label: String
-    ) {
-        val sizeSource = chars ?: manager.getCameraCharacteristics(logicalId)
-        val rawSizes = sizeSource.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            ?.getOutputSizes(ImageFormat.RAW_SENSOR)
-        if (rawSizes == null || rawSizes.isEmpty()) {
-            log("  RAW: nessuna misura dichiarata, salto questo scatto.")
-            return
-        }
-        val size = rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() } ?: return
-        log("  Provo uno scatto RAW a ${size.width}x${size.height}...")
-
-        val thread = HandlerThread("cam-$label")
-        thread.start()
-        val handler = Handler(thread.looper)
-        val executor = Executor { r -> handler.post(r) }
-
-        var camera: CameraDevice? = null
-        var session: CameraCaptureSession? = null
-        var reader: ImageReader? = null
+        latch.await(8, TimeUnit.SECONDS)
+        val sess = session ?: return
+        lenteAttuale = lente
 
         try {
-            // 1) Apro la fotocamera
-            log("  [1/6] apro la fotocamera...")
-            val openLatch = CountDownLatch(1)
-            var openError: String? = null
-            manager.openCamera(logicalId, executor, object : CameraDevice.StateCallback() {
-                override fun onOpened(c: CameraDevice) {
-                    camera = c
-                    openLatch.countDown()
+            val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            richiesta.addTarget(anteprima)
+            richiesta.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+            sess.setRepeatingRequest(richiesta.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                    res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { ultimoExpoNs = it }
+                    res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { ultimoIso = it }
+                    res.get(CaptureResult.CONTROL_AF_STATE)?.let { ultimoAfState = it }
+                    res.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { ultimoFocusDistance = it }
                 }
-
-                override fun onDisconnected(c: CameraDevice) {
-                    c.close()
-                    openError = "si è disconnessa"
-                    openLatch.countDown()
-                }
-
-                override fun onError(c: CameraDevice, error: Int) {
-                    c.close()
-                    openError = "errore $error"
-                    openLatch.countDown()
-                }
-            })
-            if (!openLatch.await(8, TimeUnit.SECONDS) || camera == null) {
-                log("  X Fotocamera non aperta: ${openError ?: "tempo scaduto"}")
-                return
-            }
-            val cam = camera!!
-
-            // 2) Preparo la ricezione delle immagini RAW.
-            // Le immagini arrivano in una coda; qualsiasi imprevisto viene
-            // annotato nel diario invece di far chiudere l'app.
-            log("  [2/6] preparo la ricezione delle immagini...")
-            val rdr = ImageReader.newInstance(size.width, size.height, ImageFormat.RAW_SENSOR, 3)
-            reader = rdr
-            val queue = LinkedBlockingQueue<Image>(2)
-            rdr.setOnImageAvailableListener({ r ->
-                try {
-                    val img = r.acquireNextImage()
-                    if (img != null && !queue.offer(img)) {
-                        img.close()
-                    }
-                } catch (t: Throwable) {
-                    log("  (avviso nella ricezione di un frame: $t)")
-                }
-            }, handler)
-
-            // 3) Apro la sessione, indicando (se serve) l'obiettivo fisico
-            log("  [3/6] apro la sessione di scatto...")
-            val outCfg = OutputConfiguration(rdr.surface)
-            if (physId != null) outCfg.setPhysicalCameraId(physId)
-            val sessLatch = CountDownLatch(1)
-            var sessError: String? = null
-            val sessCfg = SessionConfiguration(
-                SessionConfiguration.SESSION_REGULAR,
-                listOf(outCfg),
-                executor,
-                object : CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(s: CameraCaptureSession) {
-                        session = s
-                        sessLatch.countDown()
-                    }
-
-                    override fun onConfigureFailed(s: CameraCaptureSession) {
-                        sessError = "il sistema ha rifiutato la configurazione"
-                        sessLatch.countDown()
-                    }
-                }
-            )
-            cam.createCaptureSession(sessCfg)
-            if (!sessLatch.await(8, TimeUnit.SECONDS) || session == null) {
-                log("  X Sessione non creata: ${sessError ?: "tempo scaduto"}")
-                return
-            }
-            val sess = session!!
-
-            // 4) Riscaldamento: alcuni scatti singoli, uno alla volta, perché
-            // l'esposizione automatica si assesti. Niente flusso continuo:
-            // è il punto che prima poteva far chiudere l'app.
-            log("  [4/6] scatti di riscaldamento...")
-            var warmOk = 0
-            for (i in 1..6) {
-                val done = CountDownLatch(1)
-                val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
-                req.addTarget(rdr.surface)
-                sess.capture(req.build(), object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(
-                        s: CameraCaptureSession,
-                        r: CaptureRequest,
-                        res: TotalCaptureResult
-                    ) {
-                        done.countDown()
-                    }
-
-                    override fun onCaptureFailed(
-                        s: CameraCaptureSession,
-                        r: CaptureRequest,
-                        f: CaptureFailure
-                    ) {
-                        done.countDown()
-                    }
-                }, handler)
-                done.await(4, TimeUnit.SECONDS)
-                val img = queue.poll(2, TimeUnit.SECONDS)
-                if (img != null) {
-                    warmOk++
-                    img.close()
-                }
-            }
-            log("  Frame RAW ricevuti nel riscaldamento: $warmOk su 6")
-            if (warmOk == 0) {
-                log("  X Questo obiettivo non produce frame RAW.")
-                return
-            }
-
-            // 5) Scatto vero e proprio
-            log("  [5/6] scatto vero e proprio...")
-            val still = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-            still.addTarget(rdr.surface)
-            val resLatch = CountDownLatch(1)
-            var result: TotalCaptureResult? = null
-            var failReason: String? = null
-            sess.capture(still.build(), object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    s: CameraCaptureSession,
-                    r: CaptureRequest,
-                    res: TotalCaptureResult
-                ) {
-                    result = res
-                    resLatch.countDown()
-                }
-
-                override fun onCaptureFailed(
-                    s: CameraCaptureSession,
-                    r: CaptureRequest,
-                    f: CaptureFailure
-                ) {
-                    failReason = "motivo ${f.reason}"
-                    resLatch.countDown()
-                }
-            }, handler)
-            if (!resLatch.await(10, TimeUnit.SECONDS) || result == null) {
-                log("  X Scatto fallito: ${failReason ?: "tempo scaduto"}")
-                return
-            }
-            val res = result!!
-            val physRes: CaptureResult? =
-                if (physId != null) res.physicalCameraResults[physId] else null
-            val usedRes: CaptureResult = physRes ?: res
-            val ts: Long? = usedRes.get(CaptureResult.SENSOR_TIMESTAMP)
-                ?: res.get(CaptureResult.SENSOR_TIMESTAMP)
-
-            var image: Image? = null
-            val t1 = System.currentTimeMillis()
-            while (image == null && System.currentTimeMillis() - t1 < 8000) {
-                val img = queue.poll(200, TimeUnit.MILLISECONDS) ?: continue
-                if (ts == null || img.timestamp == ts) {
-                    image = img
-                } else {
-                    img.close()
-                }
-            }
-            if (image == null) {
-                log("  X Immagine RAW dello scatto non ricevuta.")
-                return
-            }
-            val imgW = image.width
-            val imgH = image.height
-
-            // 6) Salvo il file DNG nella Galleria
-            log("  [6/6] salvo il file DNG...")
-            val dngChars = chars ?: manager.getCameraCharacteristics(logicalId)
-            val name = "raw_test_${label}_${System.currentTimeMillis()}.dng"
-            val values = ContentValues()
-            values.put(MediaStore.Images.Media.DISPLAY_NAME, name)
-            values.put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
-            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FoldRawTest")
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-            if (uri == null) {
-                log("  X Non riesco a creare il file nella Galleria.")
-                image.close()
-                return
-            }
-            try {
-                contentResolver.openOutputStream(uri).use { stream ->
-                    if (stream == null) {
-                        log("  X Non riesco a scrivere il file.")
-                    } else {
-                        val dng = DngCreator(dngChars, usedRes)
-                        dng.writeImage(stream, image)
-                        dng.close()
-                    }
-                }
-            } catch (t: Throwable) {
-                log("  X Errore nel salvataggio del DNG: ${describeError(t)}")
-                image.close()
-                return
-            }
-            image.close()
-
-            // 7) Dati dello scatto
-            val expo = usedRes.get(CaptureResult.SENSOR_EXPOSURE_TIME)
-            val iso = usedRes.get(CaptureResult.SENSOR_SENSITIVITY)
-            val focalUsed = usedRes.get(CaptureResult.LENS_FOCAL_LENGTH)
-            val active = res.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
-            val expoText = if (expo != null && expo > 0) "1/${Math.round(1e9 / expo)} s" else "?"
-            log("  OK Scatto RAW riuscito: ${imgW}x${imgH}")
-            log("     tempo di scatto: $expoText, ISO: ${iso ?: "?"}, focale: ${focalUsed ?: "?"}mm")
-            log("     obiettivo realmente attivo: ${active ?: "non indicato"}")
-            log("     file: $name")
+            }, cameraHandler)
+            sessionePronta = true
         } catch (t: Throwable) {
-            log("  X Errore: ${describeError(t)}")
-        } finally {
+            logFile.appendText("Errore avvio preview: ${describeError(t)}\n")
+        }
+    }
+
+    // --------------------------------------------------------
+    // Scatto
+    // --------------------------------------------------------
+
+    private fun avviaScatto() {
+        if (inElaborazione) return
+        val sc = scenarioSelezionato ?: return
+        inElaborazione = true
+        bottoneScatta.isEnabled = false
+        uiHandler.post { statoView.text = "Preparo l'obiettivo per: ${sc.nome}..." }
+        cameraHandler.post {
             try {
-                session?.close()
+                eseguiScatto(sc)
+            } catch (t: Throwable) {
+                logFile.appendText("Errore scatto: ${describeError(t)}\n")
+                uiHandler.post { statoView.text = "Errore durante lo scatto: ${describeError(t)}" }
+            } finally {
+                inElaborazione = false
+                uiHandler.post { bottoneScatta.isEnabled = true }
+            }
+        }
+    }
+
+    private fun eseguiScatto(sc: Scenario) {
+        configuraSessione(sc.lente)
+        val cam = cameraDevice ?: return
+        val sess = session ?: return
+        val chars = caratteristiche[sc.lente] ?: cameraManager.getCameraCharacteristics(backId)
+        val rawR = rawReader
+        val jpegR = jpegReader
+
+        uiHandler.post { statoView.text = "Leggo la luce della scena..." }
+        Thread.sleep(400) // lascia convergere la misurazione automatica già in corso
+
+        if (sc.fuoco != Fuoco.INFINITO) {
+            uiHandler.post { statoView.text = "Metto a fuoco..." }
+            val inizio = System.currentTimeMillis()
+            while (ultimoAfState != CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED &&
+                ultimoAfState != CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED &&
+                System.currentTimeMillis() - inizio < 1500
+            ) {
+                Thread.sleep(50)
+            }
+        }
+        val distanzaFuoco = if (sc.fuoco == Fuoco.INFINITO) 0f else ultimoFocusDistance
+
+        val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        val expoRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val risultato = Solver.risolvi(
+            sc, ultimoExpoNs, ultimoIso,
+            expoRange?.lower ?: 1_000_000L, expoRange?.upper ?: 2_000_000_000L,
+            isoRange?.lower ?: 50, isoRange?.upper ?: 3200
+        )
+
+        uiHandler.post { statoView.text = "Scatto in corso...\nTempo: 1/${(1_000_000_000.0 / risultato.tempoNs).roundToInt()} s   ISO: ${risultato.iso}" }
+
+        val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        rawR?.let { richiesta.addTarget(it.surface) }
+        jpegR?.let { richiesta.addTarget(it.surface) }
+        richiesta.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+        richiesta.set(CaptureRequest.SENSOR_EXPOSURE_TIME, risultato.tempoNs)
+        richiesta.set(CaptureRequest.SENSOR_SENSITIVITY, risultato.iso)
+        val frameMin = chars.get(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION)
+        if (frameMin != null) richiesta.set(CaptureRequest.SENSOR_FRAME_DURATION, minOf(risultato.tempoNs + 10_000_000L, frameMin))
+        richiesta.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+        richiesta.set(CaptureRequest.LENS_FOCUS_DISTANCE, distanzaFuoco)
+        richiesta.set(CaptureRequest.CONTROL_AWB_MODE, sc.bilanciamento.modo)
+        richiesta.set(CaptureRequest.JPEG_ORIENTATION, orientamentoJpeg(chars))
+        richiesta.set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+
+        val latch = CountDownLatch(1)
+        var result: TotalCaptureResult? = null
+        sess.capture(richiesta.build(), object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                result = res
+                latch.countDown()
+            }
+            override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
+                latch.countDown()
+            }
+        }, cameraHandler)
+        if (!latch.await(10, TimeUnit.SECONDS) || result == null) {
+            uiHandler.post { statoView.text = "Scatto non riuscito, riprova." }
+            return
+        }
+        val res = result!!
+        val ts = res.get(CaptureResult.SENSOR_TIMESTAMP)
+
+        val sloggiato = sc.nome.lowercase(Locale.ITALY)
+            .replace(Regex("[^a-z0-9]+"), "_").trim('_')
+        val base = "${sloggiato}_${System.currentTimeMillis()}"
+
+        var nomeFileRaw = ""
+        if (rawR != null) {
+            var img: Image? = null
+            val fine = System.currentTimeMillis() + 4000
+            while (img == null && System.currentTimeMillis() < fine) {
+                val candidato = codaRaw.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (ts == null || candidato.timestamp == ts) img = candidato else candidato.close()
+            }
+            if (img != null) {
+                nomeFileRaw = salvaRaw(chars, res, img, "$base.dng")
+            }
+        }
+        var nomeFileJpeg = ""
+        if (jpegR != null) {
+            var img: Image? = null
+            val fine = System.currentTimeMillis() + 4000
+            while (img == null && System.currentTimeMillis() < fine) {
+                val candidato = codaJpeg.poll(200, TimeUnit.MILLISECONDS) ?: continue
+                if (ts == null || candidato.timestamp == ts) img = candidato else candidato.close()
+            }
+            if (img != null) {
+                nomeFileJpeg = salvaJpeg(img, "$base.jpg")
+            }
+        }
+
+        val expoText = "1/${(1_000_000_000.0 / risultato.tempoNs).roundToInt()} s"
+        val testo = buildString {
+            append("Scenario: ${sc.nome}\n")
+            append("Obiettivo: ${sc.lente}\n")
+            append("Tempo di scatto: $expoText   ISO: ${risultato.iso}\n\n")
+            append("${sc.consiglio}\n\n")
+            if (nomeFileJpeg.isNotEmpty()) append("Foto: $nomeFileJpeg\n")
+            if (nomeFileRaw.isNotEmpty()) append("RAW: $nomeFileRaw\n")
+            append("\nCartella: Pictures/FotoScenari")
+        }
+        uiHandler.post { statoView.text = testo }
+    }
+
+    private fun orientamentoJpeg(chars: CameraCharacteristics): Int {
+        val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        @Suppress("DEPRECATION")
+        val rotazione = windowManager.defaultDisplay.rotation
+        val gradi = when (rotazione) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+        return (sensorOrientation - gradi + 360) % 360
+    }
+
+    private fun salvaRaw(chars: CameraCharacteristics, res: TotalCaptureResult, img: Image, nome: String): String {
+        return try {
+            val values = ContentValues()
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, nome)
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FotoScenari")
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return ""
+            contentResolver.openOutputStream(uri)?.use { stream ->
+                val dng = DngCreator(chars, res)
+                dng.writeImage(stream, img)
+                dng.close()
+            }
+            img.close()
+            nome
+        } catch (t: Throwable) {
+            logFile.appendText("Errore salvaRaw: ${describeError(t)}\n")
+            try {
+                img.close()
             } catch (_: Throwable) {
             }
+            ""
+        }
+    }
+
+    private fun salvaJpeg(img: Image, nome: String): String {
+        return try {
+            val buffer = img.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            val values = ContentValues()
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, nome)
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/FotoScenari")
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return ""
+            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            img.close()
+            nome
+        } catch (t: Throwable) {
+            logFile.appendText("Errore salvaJpeg: ${describeError(t)}\n")
             try {
-                camera?.close()
+                img.close()
             } catch (_: Throwable) {
             }
-            try {
-                reader?.close()
-            } catch (_: Throwable) {
-            }
-            thread.quitSafely()
-            try {
-                Thread.sleep(600)
-            } catch (_: Throwable) {
-            }
+            ""
+        }
+    }
+
+    private fun chiudiTutto() {
+        try {
+            session?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            cameraDevice?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            rawReader?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            jpegReader?.close()
+        } catch (_: Throwable) {
         }
     }
 }
