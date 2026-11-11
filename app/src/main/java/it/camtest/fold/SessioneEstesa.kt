@@ -193,11 +193,6 @@ class SessioneEstesa(
                 esito.countDown()
             }
 
-            override fun onCaptureFailed(session: CameraExtensionSession, request: CaptureRequest, failure: Int) {
-                fallita = true
-                esito.countDown()
-            }
-
             override fun onCaptureSequenceAborted(session: CameraExtensionSession, sequenceId: Int) {
                 fallita = true
                 esito.countDown()
