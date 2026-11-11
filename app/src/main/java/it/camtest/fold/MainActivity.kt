@@ -662,6 +662,17 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     // --------------------------------------------------------
 
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        try {
+            val chars = caratteristiche[Lente.PRINCIPALE] ?: cameraManager.getCameraCharacteristics(backId)
+            val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val taglia = mappa?.getOutputSizes(SurfaceTexture::class.java)
+                ?.minByOrNull { kotlin.math.abs(it.width.toLong() * height - it.height.toLong() * width) }
+            if (taglia != null) {
+                surface.setDefaultBufferSize(taglia.width, taglia.height)
+            }
+        } catch (t: Throwable) {
+            logFile.appendText("Errore impostazione dimensione anteprima: ${describeError(t)}\n")
+        }
         previewSurface = Surface(surface)
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             apriFotocamera()
@@ -804,65 +815,79 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         } catch (_: Throwable) {
         }
 
-        val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
-        val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val rawSize = mappa?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
-        val jpegSize = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
-
-        val nuovoRaw = if (rawSize != null) ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2) else null
-        val nuovoJpeg = if (jpegSize != null) ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2) else null
-        nuovoRaw?.setOnImageAvailableListener({ r ->
-            try {
-                val img = r.acquireNextImage()
-                if (img != null && !codaRaw.offer(img)) img.close()
-            } catch (_: Throwable) {
-            }
-        }, cameraHandler)
-        nuovoJpeg?.setOnImageAvailableListener({ r ->
-            try {
-                val img = r.acquireNextImage()
-                if (img != null && !codaJpeg.offer(img)) img.close()
-            } catch (_: Throwable) {
-            }
-        }, cameraHandler)
-        rawReader = nuovoRaw
-        jpegReader = nuovoJpeg
-
-        val fisicoId = fisici[lente]
-        val configAnteprima = OutputConfiguration(anteprima)
-        val configRaw = nuovoRaw?.let { OutputConfiguration(it.surface) }
-        val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
-        if (fisicoId != null) {
-            configAnteprima.setPhysicalCameraId(fisicoId)
-            configRaw?.setPhysicalCameraId(fisicoId)
-            configJpeg?.setPhysicalCameraId(fisicoId)
-        }
-        val surfaces = listOfNotNull(configAnteprima, configRaw, configJpeg)
-
-        val latch = CountDownLatch(1)
         try {
-            cam.createCaptureSession(
-                SessionConfiguration(
-                    SessionConfiguration.SESSION_REGULAR, surfaces, cameraExecutor,
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(s: CameraCaptureSession) {
-                            session = s
-                            latch.countDown()
+            val chars = caratteristiche[lente] ?: cameraManager.getCameraCharacteristics(backId)
+            val mappa = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val rawSize = mappa?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width.toLong() * it.height }
+            val jpegSize = mappa?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width.toLong() * it.height }
+
+            val nuovoRaw = if (rawSize != null) ImageReader.newInstance(rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2) else null
+            val nuovoJpeg = if (jpegSize != null) ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2) else null
+            nuovoRaw?.setOnImageAvailableListener({ r ->
+                try {
+                    val img = r.acquireNextImage()
+                    if (img != null && !codaRaw.offer(img)) img.close()
+                } catch (_: Throwable) {
+                }
+            }, cameraHandler)
+            nuovoJpeg?.setOnImageAvailableListener({ r ->
+                try {
+                    val img = r.acquireNextImage()
+                    if (img != null && !codaJpeg.offer(img)) img.close()
+                } catch (_: Throwable) {
+                }
+            }, cameraHandler)
+            rawReader = nuovoRaw
+            jpegReader = nuovoJpeg
+
+            val fisicoId = fisici[lente]
+            val configAnteprima = OutputConfiguration(anteprima)
+            val configRaw = nuovoRaw?.let { OutputConfiguration(it.surface) }
+            val configJpeg = nuovoJpeg?.let { OutputConfiguration(it.surface) }
+            if (fisicoId != null) {
+                configAnteprima.setPhysicalCameraId(fisicoId)
+                configRaw?.setPhysicalCameraId(fisicoId)
+                configJpeg?.setPhysicalCameraId(fisicoId)
+            }
+            val surfaces = listOfNotNull(configAnteprima, configRaw, configJpeg)
+
+            val latch = CountDownLatch(1)
+            var erroreCreazione = ""
+            try {
+                cam.createCaptureSession(
+                    SessionConfiguration(
+                        SessionConfiguration.SESSION_REGULAR, surfaces, cameraExecutor,
+                        object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s: CameraCaptureSession) {
+                                session = s
+                                latch.countDown()
+                            }
+                            override fun onConfigureFailed(s: CameraCaptureSession) {
+                                erroreCreazione = "il sistema della fotocamera ha rifiutato la combinazione anteprima+RAW+JPEG per l'obiettivo $lente"
+                                latch.countDown()
+                            }
                         }
-                        override fun onConfigureFailed(s: CameraCaptureSession) {
-                            latch.countDown()
-                        }
-                    }
+                    )
                 )
-            )
-        } catch (t: Throwable) {
-            logFile.appendText("Errore createCaptureSession: ${describeError(t)}\n")
-        }
-        latch.await(8, TimeUnit.SECONDS)
-        val sess = session ?: return
-        lenteAttuale = lente
+            } catch (t: Throwable) {
+                erroreCreazione = describeError(t)
+            }
+            val completata = latch.await(8, TimeUnit.SECONDS)
+            val sess = session
+            if (sess == null) {
+                val motivo = when {
+                    !completata -> "tempo scaduto in attesa della fotocamera"
+                    erroreCreazione.isNotEmpty() -> erroreCreazione
+                    else -> "motivo sconosciuto"
+                }
+                logFile.appendText("Sessione non configurata (lente=$lente, raw=$rawSize, jpeg=$jpegSize): $motivo\n")
+                uiHandler.post {
+                    statoView.text = "Non riesco ad avviare l'anteprima (obiettivo: $lente).\n$motivo\n\nPremi 'Copia report' e mandami il testo per sistemarlo."
+                }
+                return
+            }
+            lenteAttuale = lente
 
-        try {
             val richiesta = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             richiesta.addTarget(anteprima)
             richiesta.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
@@ -876,7 +901,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             }, cameraHandler)
             sessionePronta = true
         } catch (t: Throwable) {
-            logFile.appendText("Errore avvio preview: ${describeError(t)}\n")
+            logFile.appendText("Errore configuraSessione (lente=$lente): ${describeError(t)}\n")
+            uiHandler.post { statoView.text = "Errore nella configurazione della fotocamera (obiettivo: $lente):\n${describeError(t)}" }
         }
     }
 
